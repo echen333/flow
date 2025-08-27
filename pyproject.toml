@@ -1,0 +1,10 @@
+[project]
+name = "flow-JKO"
+version = "0.1"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+    "numpy>=2.0.2",
+    "pillow>=11.3.0",
+    "torch>=2.8.0",
+]
