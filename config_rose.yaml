@@ -1,0 +1,11 @@
+image_path: img_rose.png
+train:
+  num_points: 10000
+  epochs_per_block: 100
+  batch_size: 500
+rho: 1.2
+h_0: 0.75
+h_max: 5
+d: 2
+sigma_0: 0.02
+num_blocks: 10
