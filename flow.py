@@ -8,6 +8,7 @@ import yaml
 import argparse
 from torch.utils.data import DataLoader, Dataset
 import os
+import torchdiffeq as tdeq
 
 
 class NN(nn.Module):
@@ -23,42 +24,56 @@ class NN(nn.Module):
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, h_k, model: nn.Module, sigma: float):
+class ODEFuncBlock(nn.Module):
+    def __init__(
+        self, h_k, model: nn.Module, sigma: float, use_fd=False, ode_solver="rk4"
+    ):
+        """ODE block using model, time independent
+
+        Args:
+            h_k (int): number of split steps
+            model (nn.Module): model for f
+            sigma (float): finite difference sigma
+            use_fd (bool, optional): use finite difference. Defaults to False.
+        """
         super().__init__()
         self.model = model
-        self.ode_solver = "rk4"
         self.h_steps = 3
         self.h_k = h_k
         self.sigma = sigma
+        self.use_fd = use_fd
+        self.ode_solver = ode_solver
 
-    def f(self, x, t):
-        y = x
-        if self.ode_solver == "rk4":
-            h = self.h_k / self.h_steps
-            for _ in range(self.h_steps):
-                k1 = self.model(x, t)
-                k2 = self.model(x + h * k1 / 2, t + h / 2)
-                k3 = self.model(x + h * k2 / 2, t + h / 2)
-                k4 = self.model(x + h * k3, t + h)
-                y = y + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
-        return y
+    def vector_field(self, t, x):
+        return self.model(x, t)
 
-    def forward(self, x, t):
-        out = self.f(x, t)
-        # use hutchinson trace estimator to compute div_f
+    def _fd_div_at(self, x, t):
+        """Finite difference hutchinson divergence at(x,t). Returns (B,1)"""
         B, D = x.shape
+        out = self.model(x, t)
         eps = torch.randn(B, D).detach()
-        out_eps = self.f(x + self.sigma * eps, t)
-        # make it so that EPS is not diffferentiated
-        eps = torch.unsqueeze(eps, -1)
+        out_eps = self.model(x + self.sigma * eps, t)
+
+        eps = torch.unsqueeze(eps, -1)  # ???
         div_f = torch.matmul((out_eps - out) / self.sigma, eps)
         div_f = div_f.mean()
-        return out, div_f
+        return div_f
+
+    def forward(self, x0, t=0.0, reverse=False):
+        t_start, t_end = float(t), float(t) + float(self.h_k)
+        t_grid = torch.linspace(t_start, t_end, self.h_steps + 1, dtype=x0.dtype)
+        if reverse:
+            t_grid = t_grid.flip(0)
+        # breakpoint()
+        x_traj = tdeq.odeint(self.vector_field, x0, t_grid, method=self.ode_solver)
+
+        # use hutchinson trace estimator to compute div_f
+        div_f = self._fd_div_at(x0, t)
+        return x_traj[-1, :], div_f
 
 
 class JKO(nn.Module):
-    def __init__(self, blocks: list[Block]):
+    def __init__(self, blocks: list[ODEFuncBlock]):
         super().__init__()
         self.blocks = nn.ModuleList(blocks)
         self.block_length = len(blocks)
@@ -175,6 +190,7 @@ def main():
     with open(path, "r") as f:
         args = yaml.safe_load(f)
     print(args)
+    torch.random.manual_seed(args["seed"])
     points = sample_points_from_image(args["image_path"], args["train"]["num_points"])
     points = torch.from_numpy(points).float()
 
@@ -184,7 +200,7 @@ def main():
     ]
     flow = JKO(
         [
-            Block(h_ks[idx], NN(), args["sigma_0"] / args["d"])
+            ODEFuncBlock(h_ks[idx], NN(), args["sigma_0"] / args["d"])
             for idx in range(args["num_blocks"])
         ]
     )
