@@ -78,14 +78,15 @@ class JKO(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.block_length = len(blocks)
 
-    def forward(self, x, t, block_idx=None):
+    def forward(self, x, t, block_idx=None, reverse=False):
         out, div_f = None, None
         if block_idx is None:
-            for block in self.blocks:
-                x, div_f = block(x, t)
+            block_order = self.blocks if not reverse else reversed(self.blocks)
+            for block in block_order:
+                x, div_f = block(x, t, reverse)
             return x, None
         else:
-            out, div_f = self.blocks[block_idx](x, t)
+            out, div_f = self.blocks[block_idx](x, t, reverse)
             return out, div_f
 
 
@@ -113,7 +114,7 @@ def sample_points_from_image(image_path, num_points=100000):
     # need to center image to 0,0
     ret = ret - 256
     print(ret)
-    return ret
+    return torch.from_numpy(ret).float()
 
 
 def train_flow(
@@ -192,7 +193,6 @@ def main():
     print(args)
     torch.random.manual_seed(args["seed"])
     points = sample_points_from_image(args["image_path"], args["train"]["num_points"])
-    points = torch.from_numpy(points).float()
 
     h_ks = [
         min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
