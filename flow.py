@@ -33,7 +33,7 @@ class Block(nn.Module):
         self.sigma = sigma
 
     def f(self, x, t):
-        y = None
+        y = x
         if self.ode_solver == "rk4":
             h = self.h_k / self.h_steps
             for _ in range(self.h_steps):
@@ -41,13 +41,14 @@ class Block(nn.Module):
                 k2 = self.model(x + h * k1 / 2, t + h / 2)
                 k3 = self.model(x + h * k2 / 2, t + h / 2)
                 k4 = self.model(x + h * k3, t + h)
-                y = x + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+                y = y + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
         return y
 
     def forward(self, x, t):
         out = self.f(x, t)
         # use hutchinson trace estimator to compute div_f
-        eps = torch.randn((out.shape[-1],)).detach()
+        B, D = x.shape
+        eps = torch.randn(B, D).detach()
         out_eps = self.f(x + self.sigma * eps, t)
         # make it so that EPS is not diffferentiated
         eps = torch.unsqueeze(eps, -1)
@@ -66,10 +67,11 @@ class JKO(nn.Module):
         out, div_f = None, None
         if block_idx is None:
             for block in self.blocks:
-                out, div_f = block(x, t)
+                x, div_f = block(x, t)
+            return x, None
         else:
             out, div_f = self.blocks[block_idx](x, t)
-        return out, div_f
+            return out, div_f
 
 
 def sample_points_from_image(image_path, num_points=100000):
@@ -121,16 +123,16 @@ def train_flow(
                 optimizer.zero_grad()
                 out, div_f = flow(batch, t=0, block_idx=block_idx)
 
-                V_loss = torch.norm(out, dim=1).mean()
+                V_loss = 0.5 * out.pow(2).sum(dim=-1).mean()
                 delta = out - batch
                 # breakpoint()
-                W_loss = 1 / (2 * block.h_k) * torch.norm(delta, dim=1).mean()
+                W_loss = 0.5 / (block.h_k) * delta.pow(2).sum(dim=-1).mean()
                 loss = V_loss + div_f + W_loss
                 print("loss", V_loss, W_loss, div_f, loss)
 
+                loss.backward()
                 if train_args["clip_grad"]:
                     torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
-                loss.backward()
                 optimizer.step()
                 print(f"Block {block_idx} loss: {loss.item()}")
                 # breakpoint()
