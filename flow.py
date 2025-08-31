@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import yaml
 import argparse
 from torch.utils.data import DataLoader, Dataset
+import os
 
 
 class NN(nn.Module):
@@ -51,7 +52,7 @@ class Block(nn.Module):
         # make it so that EPS is not diffferentiated
         eps = torch.unsqueeze(eps, -1)
         div_f = torch.matmul((out_eps - out) / self.sigma, eps)
-        div_f = div_f.sum()
+        div_f = div_f.mean()
         return out, div_f
 
 
@@ -99,9 +100,10 @@ def sample_points_from_image(image_path, num_points=100000):
 
 
 def train_flow(
-    flow: JKO, train_dataset: Dataset, train_args, test_dataset: Dataset | None = None
+    flow: JKO, train_dataset: Dataset, args: dict, test_dataset: Dataset | None = None
 ):
     """train block by block"""
+    train_args = args["train"]
     assert len(train_dataset) == train_args["num_points"]
     data_loader = DataLoader(train_dataset, train_args["batch_size"], shuffle=True)
     batches = []
@@ -113,7 +115,7 @@ def train_flow(
 
     for block_idx in range(flow.block_length):
         block = flow.blocks[block_idx]
-        optimizer = torch.optim.Adam(block.parameters(), lr=0.01)
+        optimizer = torch.optim.Adam(block.parameters(), lr=train_args["lr"])
         for epoch_idx in range(train_args["epochs_per_block"]):
             for batch_idx, batch in enumerate(batches):
                 optimizer.zero_grad()
@@ -126,6 +128,8 @@ def train_flow(
                 loss = V_loss + div_f + W_loss
                 print("loss", V_loss, W_loss, div_f, loss)
 
+                if train_args["clip_grad"]:
+                    torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
                 loss.backward()
                 optimizer.step()
                 print(f"Block {block_idx} loss: {loss.item()}")
@@ -136,6 +140,14 @@ def train_flow(
             with torch.no_grad():
                 batches[batch_idx], _ = flow(batch, t=0, block_idx=block_idx)
 
+        # save block parameters
+        sdict = {
+            "model": flow.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": args,
+        }
+        os.makedirs("chkpt", exist_ok=True)
+        torch.save(sdict, f"chkpt/{train_args['save_path']}_{block_idx}.pth")
         plt.scatter(
             batches[0][:, 0].detach().numpy(),
             batches[0][:, 1].detach().numpy(),
@@ -176,7 +188,7 @@ def main():
     )
 
     train_dataset = MyDataset(points)
-    train_flow(flow, train_dataset, args["train"])
+    train_flow(flow, train_dataset, args)
 
 
 if __name__ == "__main__":
