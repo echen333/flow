@@ -12,21 +12,31 @@ import torchdiffeq as tdeq
 
 
 class NN(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super(NN, self).__init__()
-        self.fc1 = nn.Linear(2, 100)
-        self.act1 = nn.ReLU()
-        self.fc2 = nn.Linear(100, 2)
+        self.layers = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 2),
+        ).to(device=device)
 
     def forward(self, x, t):
-        x = self.act1(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        return self.layers(x)
 
 
 class ODEFuncBlock(nn.Module):
     def __init__(
-        self, h_k, model: nn.Module, sigma: float, use_fd=False, ode_solver="rk4"
+        self,
+        h_k,
+        model: nn.Module,
+        sigma: float,
+        use_fd=False,
+        ode_solver="rk4",
+        device="cpu",
     ):
         """ODE block using model, time independent
 
@@ -43,6 +53,7 @@ class ODEFuncBlock(nn.Module):
         self.sigma = sigma
         self.use_fd = use_fd
         self.ode_solver = ode_solver
+        self.device = device
 
     def vector_field(self, t, x):
         return self.model(x, t)
@@ -119,7 +130,11 @@ def sample_points_from_image(image_path, num_points=100000):
 
 
 def train_flow(
-    flow: JKO, train_dataset: Dataset, args: dict, test_dataset: Dataset | None = None
+    flow: JKO,
+    train_dataset: Dataset,
+    args: dict,
+    test_dataset: Dataset | None = None,
+    device="cpu",
 ):
     """train block by block"""
     train_args = args["train"]
@@ -159,7 +174,7 @@ def train_flow(
                         "div: ",
                         div_loss.item(),
                         "total: ",
-                        loss,
+                        loss.item(),
                     )
                     print(f"Block {block_idx} loss: {loss.item()}")
                 # breakpoint()
@@ -204,6 +219,7 @@ def main():
     print(args)
     torch.random.manual_seed(args["seed"])
     points = sample_points_from_image(args["image_path"], args["train"]["num_points"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     h_ks = [
         min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
@@ -211,13 +227,14 @@ def main():
     ]
     flow = JKO(
         [
-            ODEFuncBlock(h_ks[idx], NN(), args["sigma_0"] / args["d"])
+            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / args["d"])
             for idx in range(args["num_blocks"])
         ]
     )
 
+    points.to(device=device)
     train_dataset = MyDataset(points)
-    train_flow(flow, train_dataset, args)
+    train_flow(flow, train_dataset, args, device=device)
 
 
 if __name__ == "__main__":
