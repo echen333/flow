@@ -1,14 +1,12 @@
 import torch
 import torch.nn as nn
 from PIL import Image
-import random
 import numpy as np
-import torch.nn.functional as F
 import yaml
-import argparse
 from torch.utils.data import DataLoader, Dataset
 import os
 import torchdiffeq as tdeq
+import matplotlib.pyplot as plt
 
 
 class NN(nn.Module):
@@ -93,7 +91,7 @@ class ODEFuncBlock(nn.Module):
 
     def forward(self, x0, t=0.0, reverse=False):
         t_start, t_end = float(t), float(t) + float(self.h_k)
-        t_grid = torch.linspace(t_start, t_end, self.h_steps + 1, dtype=x0.dtype)
+        t_grid = torch.linspace(t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device)
         if reverse:
             t_grid = t_grid.flip(0)
 
@@ -102,7 +100,6 @@ class ODEFuncBlock(nn.Module):
         jac0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
 
         self._prepare_eps(x0, n_eps=self.n_eps)
-        # breakpoint()
         xT, logdetT, jacT = tdeq.odeint(
             self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
         )
@@ -159,7 +156,6 @@ def train_flow(
     flow: JKO,
     train_dataset: Dataset,
     args: dict,
-    test_dataset: Dataset | None = None,
     device="cpu",
 ):
     """train block by block"""
@@ -170,22 +166,21 @@ def train_flow(
     for points in data_loader:
         batches.append(points)
 
-    import matplotlib.pyplot as plt
 
     for block_idx in range(flow.block_length):
         block = flow.blocks[block_idx]
         optimizer = torch.optim.Adam(block.parameters(), lr=train_args["lr"])
         for epoch_idx in range(train_args["epochs_per_block"]):
             for batch_idx, batch in enumerate(batches):
+                batch = batch.to(device)
                 optimizer.zero_grad()
                 out, div_f = flow(batch, t=0, block_idx=block_idx)
 
                 V_loss = 0.5 * out.pow(2).sum(dim=-1).mean()
                 delta = out - batch
-                # breakpoint()
                 W_loss = 0.5 / (block.h_k) * delta.pow(2).sum(dim=-1).mean()
                 div_loss = div_f.mean()
-                loss = V_loss - div_loss + W_loss
+                loss = V_loss + div_loss + W_loss
 
                 loss.backward()
                 if train_args["clip_grad"]:
@@ -193,19 +188,9 @@ def train_flow(
                 optimizer.step()
                 if epoch_idx % 50 == 0:
                     print(
-                        "loss",
-                        V_loss.item(),
-                        "W_loss: ",
-                        W_loss.item(),
-                        "div: ",
-                        div_loss.item(),
-                        "total: ",
-                        loss.item(),
+                        f"total: {loss.item()} V_loss: {V_loss.item()} W_loss: {W_loss.item(),} div: {div_loss.item()}"
                     )
-                    print(f"Block {block_idx} loss: {loss.item()}")
-                # breakpoint()
 
-        # Use detach() to create a new tensor and avoid graph reuse
         for batch_idx, batch in enumerate(batches):
             with torch.no_grad():
                 batches[batch_idx], _ = flow(batch, t=0, block_idx=block_idx)
@@ -219,10 +204,10 @@ def train_flow(
         os.makedirs("chkpt", exist_ok=True)
         torch.save(sdict, f"chkpt/{train_args['save_path']}_{block_idx}.pth")
         plt.scatter(
-            batches[0][:, 0].detach().numpy(),
-            batches[0][:, 1].detach().numpy(),
+            batches[0][:, 0].cpu().detach().numpy(),
+            batches[0][:, 1].cpu().detach().numpy(),
         )
-        plt.savefig(f"block_{block_idx}.png")
+        plt.savefig(f"assets/forward_block_{block_idx}.png")
         plt.close()
 
 
@@ -253,12 +238,12 @@ def main():
     ]
     flow = JKO(
         [
-            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / args["d"])
+            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / args["d"], device=device)
             for idx in range(args["num_blocks"])
         ]
     )
 
-    points.to(device=device)
+    points = points.to(device=device)
     train_dataset = MyDataset(points)
     train_flow(flow, train_dataset, args, device=device)
 
