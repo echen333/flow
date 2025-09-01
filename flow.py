@@ -61,13 +61,13 @@ class ODEFuncBlock(nn.Module):
         """Finite difference hutchinson divergence at(x,t). Returns (B,1)
             f_m is if already evaluated f(x, t)
         """
-        assert len(self._eps_cache) != 0, "need to call _prepare_eps"
         with torch.no_grad():
             rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
         sigma_base = self.sigma if self.sigma > 0 else 1e-2
         sigma = torch.maximum(torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base)
 
         acc = 0.0
+        self._eps_cache = [torch.randn_like(x) for _ in range(self.n_eps)]
         for eps in self._eps_cache:
             f_p = self.model(x + sigma * eps, t)  # (B, D)
             if f_m is None:
@@ -76,14 +76,6 @@ class ODEFuncBlock(nn.Module):
             jvp = (f_p - f_m) / (sigma)  # J_f @ e
             acc += (jvp * eps).sum(dim=-1)
         return acc / len(self._eps_cache)
-
-    def _prepare_eps(self, x, n_eps):
-        """Cache constant eps to use across tdeq ode integral"""
-        eps_list = []
-        for _ in range(n_eps):
-            eps = torch.randn_like(x)
-            eps_list.append(eps)
-        self._eps_cache = eps_list
 
     def _rhs(self, t, state):
         """torchdiffeq expects (t,state) where state = (x, logdet, jacint)"""
@@ -105,7 +97,6 @@ class ODEFuncBlock(nn.Module):
         logdet0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
         jac0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
 
-        self._prepare_eps(x0, n_eps=self.n_eps)
         xT, logdetT, jacT = tdeq.odeint(
             self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
         )
@@ -148,7 +139,7 @@ def sample_points_from_image(image_path, num_points=10000):
     xx, yy = np.meshgrid(x, y)
     xx = np.reshape(xx, (-1, 1))
     yy = np.reshape(yy, (-1, 1))
-    means = np.concat([xx, yy], 1)
+    means = np.concatenate([xx, yy], 1)
 
     img = image_mask.max() - image_mask
     probs = img.reshape(-1) / img.sum()
@@ -194,7 +185,7 @@ def train_flow(
                 if train_args["clip_grad"]:
                     torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
                 optimizer.step()
-                if epoch_idx % 50 == 0:
+                if (epoch_idx + 1) % 50 == 0:
                     print(
                         f"block {block_idx} total: {loss.item():.2f} V_loss: {V_loss.item():.2f} W_loss: {W_loss.item():.2f} div: {div_loss.item():.2f}"
                     )
@@ -273,9 +264,10 @@ def main():
         min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
         for idx in range(args["num_blocks"])
     ]
+    method = "rk4"
     flow = JKO(
         [
-            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / args["d"], device=device)
+            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / np.sqrt(args["d"]), device=device, ode_solver=method)
             for idx in range(args["num_blocks"])
         ]
     )
@@ -286,11 +278,14 @@ def main():
     train_flow(flow, train_dataset, args, device=device)
     print(f"h_k before {[block.h_k for block in flow.blocks]}")
     reparameterize_trajectory(flow, points, 10, args["ema_parameter"], args["h_max"])
-    print(f"h_k after {[block.h_k for block in flow.blocks]}")
+    h_ks = [block.h_k for block in flow.blocks]
+    print(f"h_k after {h_ks}")
+    train_flow(flow, train_dataset, args, device=device)
 
     sdict = {
         "model": flow.state_dict(),
         "args": args,
+        "h_ks": h_ks,
     }
     os.makedirs("chkpt", exist_ok=True)
     torch.save(sdict, f"chkpt/{train_args['save_path']}.pth")

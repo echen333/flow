@@ -4,17 +4,19 @@ import os
 import yaml
 from flow import JKO, ODEFuncBlock, NN, sample_points_from_image, reparameterize_trajectory
 import matplotlib.pyplot as plt
+import numpy as np
+
+def test_forward():
+    pass
 
 def main():
-    save_path = "train_1_7"
+    save_path = "train_1"
     device = ("cuda" if torch.cuda.is_available() else "cpu")
     sdict = torch.load(f"chkpt/{save_path}.pth")
     args = sdict["args"]
-    train_args = args["train"]
-    h_ks = [
-        min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
-        for idx in range(args["num_blocks"])
-    ]
+    h_ks = sdict["h_ks"]
+    # h_ks =[np.float64(0.08704150759150331), np.float64(0.1831668147369398), np.float64(0.5342127305485939), np.float64(1.4043969599112267), np.float64(2.8153883490293747), np.float64(5.0), np.float64(5.0), np.float64(5.0)]
+
     flow = JKO(
         [
             ODEFuncBlock(
@@ -25,14 +27,9 @@ def main():
     ).to(device)
     flow.load_state_dict(sdict["model"])
 
-    num_points = 5000
-    # points = torch.randn((num_points, 2))
-    # p_x, _ = flow(points, 0, None, True)
-    # plt.scatter(x=p_x[:, 0].detach().numpy(), y=p_x[:, 1].detach().numpy())
-    # plt.show()
+    num_points = 10000
 
     points = torch.randn((num_points, 2)).to(device)
-    # fig, axs = plt.subplots(3, 3)
     with torch.no_grad():
         for idx, block in reversed(list(enumerate(flow.blocks))):
             p_z = points
@@ -44,12 +41,6 @@ def main():
             p_x, _, _ = block(points, reverse=True)
 
             points = p_x
-
-    # points2 = sample_points_from_image(args["image_path"], 500)
-    # zz, _ = flow(points2, 0)
-    # breakpoint()
-    # plt.scatter(x=zz[:, 0].detach().numpy(), y=zz[:, 1].detach().numpy())
-    # plt.show()
 
 
 if __name__ == "__main__":
