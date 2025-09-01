@@ -47,17 +47,18 @@ class ODEFuncBlock(nn.Module):
     def vector_field(self, t, x):
         return self.model(x, t)
 
-    def _fd_div_at(self, x, t):
+    def _fd_div_at(self, x, t, n_eps=1):
         """Finite difference hutchinson divergence at(x,t). Returns (B,1)"""
-        B, D = x.shape
-        out = self.model(x, t)
-        eps = torch.randn(B, D).detach()
-        out_eps = self.model(x + self.sigma * eps, t)
+        divs = []
+        for _ in range(n_eps):
+            eps = torch.randn_like(x)  # (B, D)
+            f_x = self.model(x, t)  # (B, D)
+            f_x_eps = self.model(x + self.sigma * eps, t)
 
-        eps = torch.unsqueeze(eps, -1)  # ???
-        div_f = torch.matmul((out_eps - out) / self.sigma, eps)
-        div_f = div_f.mean()
-        return div_f
+            div_f = ((f_x_eps - f_x) / self.sigma) * eps
+            div = div_f.sum(dim=-1)  # (B, )
+            divs.append(div)
+        return torch.stack(divs, dim=0).mean(dim=0)
 
     def forward(self, x0, t=0.0, reverse=False):
         t_start, t_end = float(t), float(t) + float(self.h_k)
@@ -97,24 +98,24 @@ def sample_points_from_image(image_path, num_points=100000):
     Returns a list of coordinates of the sampled points.
     """
     image = Image.open(image_path)
-    image = image.resize((512, 512))
-    image = image.convert("L")
+    # not sure where transforms but grayscale image
+    image_mask = np.array(image.rotate(180).transpose(0).convert("L"))
 
-    points = []
-    for i in range(512):
-        for j in range(512):
-            if image.getpixel((i, j)) < 100:
-                points.append((i, j))
+    w, h = image.size
+    x = np.linspace(-4, 4, w)
+    y = np.linspace(-4, 4, h)
+    xx, yy = np.meshgrid(x, y)
+    xx = np.reshape(xx, (-1, 1))
+    yy = np.reshape(yy, (-1, 1))
+    means = np.concat([xx, yy], 1)
 
-    points = np.array(points)
-    idxs = np.random.randint(0, len(points), (num_points,))
-
-    ret = points[idxs]
-
-    # need to center image to 0,0
-    ret = ret - 256
-    print(ret)
-    return torch.from_numpy(ret).float()
+    img = image_mask.max() - image_mask
+    probs = img.reshape(-1) / img.sum()
+    std = np.array([8 / w / 2, 8 / h / 2])
+    inds = np.random.choice(int(probs.shape[0]), num_points, p=probs)
+    m = means[inds]
+    samples = np.random.randn(*m.shape) * std + m
+    return torch.tensor(samples, dtype=torch.float32)
 
 
 def train_flow(
@@ -126,7 +127,6 @@ def train_flow(
     data_loader = DataLoader(train_dataset, train_args["batch_size"], shuffle=True)
     batches = []
     for points in data_loader:
-        print("points", type(points))
         batches.append(points)
 
     import matplotlib.pyplot as plt
@@ -143,14 +143,25 @@ def train_flow(
                 delta = out - batch
                 # breakpoint()
                 W_loss = 0.5 / (block.h_k) * delta.pow(2).sum(dim=-1).mean()
-                loss = V_loss + div_f + W_loss
-                print("loss", V_loss, W_loss, div_f, loss)
+                div_loss = div_f.mean()
+                loss = V_loss - div_loss + W_loss
 
                 loss.backward()
                 if train_args["clip_grad"]:
                     torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
                 optimizer.step()
-                print(f"Block {block_idx} loss: {loss.item()}")
+                if epoch_idx % 50 == 0:
+                    print(
+                        "loss",
+                        V_loss.item(),
+                        "W_loss: ",
+                        W_loss.item(),
+                        "div: ",
+                        div_loss.item(),
+                        "total: ",
+                        loss,
+                    )
+                    print(f"Block {block_idx} loss: {loss.item()}")
                 # breakpoint()
 
         # Use detach() to create a new tensor and avoid graph reuse
