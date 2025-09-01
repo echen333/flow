@@ -37,6 +37,7 @@ class ODEFuncBlock(nn.Module):
         use_fd=False,
         ode_solver="rk4",
         device="cpu",
+        n_eps=1,
     ):
         """ODE block using model, time independent
 
@@ -54,34 +55,59 @@ class ODEFuncBlock(nn.Module):
         self.use_fd = use_fd
         self.ode_solver = ode_solver
         self.device = device
+        self.n_eps = n_eps
 
-    def vector_field(self, t, x):
-        return self.model(x, t)
-
-    def _fd_div_at(self, x, t, n_eps=1):
+    def _fd_div_at(self, x, t):
         """Finite difference hutchinson divergence at(x,t). Returns (B,1)"""
-        divs = []
-        for _ in range(n_eps):
-            eps = torch.randn_like(x)  # (B, D)
-            f_x = self.model(x, t)  # (B, D)
-            f_x_eps = self.model(x + self.sigma * eps, t)
+        assert len(self._eps_cache) != 0, "need to call _prepare_eps"
+        with torch.no_grad():
+            rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
+        sigma = max(1e-4, (self.sigma if self.sigma > 0 else 1e-2) * rms.item())
 
-            div_f = ((f_x_eps - f_x) / self.sigma) * eps
-            div = div_f.sum(dim=-1)  # (B, )
-            divs.append(div)
-        return torch.stack(divs, dim=0).mean(dim=0)
+        acc = 0.0
+        for eps in self._eps_cache:
+            f_p = self.model(x + sigma * eps, t)  # (B, D)
+            f_m = self.model(x - sigma * eps, t)
+
+            jvp = (f_p - f_m) / (2 * sigma)  # J_f @ e
+            acc += (jvp * eps).sum(dim=-1)
+        return acc / len(self._eps_cache)
+
+    def _prepare_eps(self, x, n_eps):
+        """constant eps across tdeq odeint"""
+        eps_list = []
+        for _ in range(n_eps):
+            eps = torch.randn_like(x)
+            eps_list.append(eps)
+        self._eps_cache = eps_list
+
+    def _rhs(self, t, state):
+        """torchdiffeq expects (t,state) where state = (x, logdet, jacint)"""
+        x, logdet, _ = state
+        vfield = self.model(x, t)
+        div = self._fd_div_at(x, t)
+
+        dlogdet_dt = -div
+        djac_dt = torch.zeros_like(logdet)
+        return (vfield, dlogdet_dt, djac_dt)
 
     def forward(self, x0, t=0.0, reverse=False):
         t_start, t_end = float(t), float(t) + float(self.h_k)
         t_grid = torch.linspace(t_start, t_end, self.h_steps + 1, dtype=x0.dtype)
         if reverse:
             t_grid = t_grid.flip(0)
-        # breakpoint()
-        x_traj = tdeq.odeint(self.vector_field, x0, t_grid, method=self.ode_solver)
 
-        # use hutchinson trace estimator to compute div_f
-        div_f = self._fd_div_at(x0, t)
-        return x_traj[-1, :], div_f
+        B, D = x0.shape
+        logdet0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
+        jac0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
+
+        self._prepare_eps(x0, n_eps=self.n_eps)
+        # breakpoint()
+        xT, logdetT, jacT = tdeq.odeint(
+            self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
+        )
+
+        return xT[-1], logdetT[-1], jacT[-1]
 
 
 class JKO(nn.Module):
@@ -95,10 +121,10 @@ class JKO(nn.Module):
         if block_idx is None:
             block_order = self.blocks if not reverse else reversed(self.blocks)
             for block in block_order:
-                x, div_f = block(x, t, reverse)
+                x, div_f, _ = block(x, t, reverse)
             return x, None
         else:
-            out, div_f = self.blocks[block_idx](x, t, reverse)
+            out, div_f, _ = self.blocks[block_idx](x, t, reverse)
             return out, div_f
 
 
