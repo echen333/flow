@@ -3,7 +3,7 @@ import torch.nn as nn
 from PIL import Image
 import numpy as np
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 import os
 import torchdiffeq as tdeq
 import matplotlib.pyplot as plt
@@ -123,13 +123,15 @@ class JKO(nn.Module):
         else:
             out, div_f, _ = self.blocks[block_idx](x, t, reverse)
             return out, div_f
+    
+    def __len__(self):
+        return self.block_length
 
 
 def sample_points_from_image(image_path, num_points=100000):
     """
-    Sample points from a black and white image.
-    Sample points from the black part of the image.
-    Returns a list of coordinates of the sampled points.
+    Data generation of distribution from image.
+    Taken from https://github.com/hamrel-cxu/JKO-iFlow
     """
     image = Image.open(image_path)
     # not sure where transforms but grayscale image
@@ -154,24 +156,27 @@ def sample_points_from_image(image_path, num_points=100000):
 
 def train_flow(
     flow: JKO,
-    train_dataset: Dataset,
+    train_dataset: IterableDataset,
     args: dict,
     device="cpu",
 ):
     """train block by block"""
     train_args = args["train"]
-    assert len(train_dataset) == train_args["num_points"]
-    data_loader = DataLoader(train_dataset, train_args["batch_size"], shuffle=True)
-    batches = []
-    for points in data_loader:
-        batches.append(points)
+
+    prev_points = [None for _ in range(len(train_dataset))]
 
 
     for block_idx in range(flow.block_length):
         block = flow.blocks[block_idx]
         optimizer = torch.optim.Adam(block.parameters(), lr=train_args["lr"])
-        for epoch_idx in range(train_args["epochs_per_block"]):
-            for batch_idx, batch in enumerate(batches):
+
+        for epoch_idx, points in enumerate(train_dataset):
+            epoch_data_loader = DataLoader(train_dataset, train_args["batch_size"])
+            prev_points = []
+            for points in epoch_data_loader:
+                prev_points.append(points)
+
+            for batch_idx, batch in enumerate(prev_points):
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 out, div_f = flow(batch, t=0, block_idx=block_idx)
@@ -188,12 +193,12 @@ def train_flow(
                 optimizer.step()
                 if epoch_idx % 50 == 0:
                     print(
-                        f"total: {loss.item()} V_loss: {V_loss.item()} W_loss: {W_loss.item(),} div: {div_loss.item()}"
+                        f"block {block_idx} total: {loss.item():.2f} V_loss: {V_loss.item():.2f} W_loss: {W_loss.item():.2f} div: {div_loss.item():.2f}"
                     )
 
-        for batch_idx, batch in enumerate(batches):
+        for batch_idx, batch in enumerate(prev_points):
             with torch.no_grad():
-                batches[batch_idx], _ = flow(batch, t=0, block_idx=block_idx)
+                prev_points[batch_idx], _ = flow(batch, t=0, block_idx=block_idx)
 
         # save block parameters
         sdict = {
@@ -207,20 +212,44 @@ def train_flow(
             batches[0][:, 0].cpu().detach().numpy(),
             batches[0][:, 1].cpu().detach().numpy(),
         )
-        plt.savefig(f"assets/forward_block_{block_idx}.png")
+        plt.savefig(f"assets/block_{block_idx}.png")
         plt.close()
 
+def reparameterize_trajectory(model: JKO, points: torch.Tensor, num_iters = 1, ema_parameter: float = 0.3, h_max: float = 5):
+    """Trajectory reparameterization as written in B.3.1"""
+    assert 0 < ema_parameter and ema_parameter < 1, "ema parameter eta must be in (0,1)"
+    for iter in range(num_iters):
+        arc_lengths = []
+        prev_points: torch.Tensor = points # (B, D)
+        for idx, block in enumerate(model.blocks):
+            cur_points, _ = model(prev_points, idx) # (B, D)
+            norms = torch.norm(cur_points - prev_points, dim=-1) # (B,)
+            arc_lengths.append(norms.mean())
+            prev_points = cur_points
+        arc_lengths = torch.tensor(arc_lengths).cpu().numpy()
+        mean_arc = np.mean(arc_lengths)
+        old_hk = np.array([block.h_k for block in model.blocks])
+        new_hk = np.minimum(old_hk + ema_parameter * (mean_arc * old_hk / arc_lengths - old_hk), h_max * np.ones_like(old_hk))
+        for block, h_k in zip(model.blocks, new_hk):
+            block.h_k = h_k
+        print(f"mean arc length {mean_arc} std {arc_lengths.std()}")
+    # TODO: Train free block in Algo 1 after reparameterize
 
-class MyDataset(Dataset):
-    def __init__(self, points):
+
+class ResamplingDataset(IterableDataset):
+    def __init__(self, sampling_fn, num_epochs, device="cpu"):
         super().__init__()
-        self.points = points
+        self.sampling_fn = sampling_fn
+        self.num_epochs = num_epochs
+        self.device = device
 
     def __len__(self):
-        return len(self.points)
+        return self.num_epochs
+    
+    def __iter__(self):
+        for _ in range(self.num_epochs):
+            yield self.sampling_fn().to(self.device)
 
-    def __getitem__(self, index):
-        return self.points[index]
 
 
 def main():
@@ -228,6 +257,7 @@ def main():
     with open(path, "r") as f:
         args = yaml.safe_load(f)
     print(args)
+
     torch.random.manual_seed(args["seed"])
     points = sample_points_from_image(args["image_path"], args["train"]["num_points"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -244,8 +274,19 @@ def main():
     )
 
     points = points.to(device=device)
-    train_dataset = MyDataset(points)
+    train_args = args["train"]
+    train_dataset = ResamplingDataset(lambda: sample_points_from_image(args["image_path"], args["train"]["num_points"]), train_args["epochs_per_block"], "cpu")
     train_flow(flow, train_dataset, args, device=device)
+    print(f"h_k before {[block.h_k for block in flow.blocks]}")
+    reparameterize_trajectory(flow, points, 10, args["ema_parameter"], args["h_max"])
+    print(f"h_k after {[block.h_k for block in flow.blocks]}")
+
+    sdict = {
+        "model": flow.state_dict(),
+        "args": args,
+    }
+    os.makedirs("chkpt", exist_ok=True)
+    torch.save(sdict, f"chkpt/{train_args['save_path']}.pth")
 
 
 if __name__ == "__main__":

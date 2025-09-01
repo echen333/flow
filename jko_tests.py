@@ -7,13 +7,11 @@ import matplotlib.pyplot as plt
 
 
 def main():
-    with open("config_rose.yaml") as f:
-        args = yaml.safe_load(f)
+    save_path = "train_1"
     device = ("cuda" if torch.cuda.is_available() else "cpu")
-    test_args = args["test"]
-    sdict = torch.load(f"chkpt/{test_args['save_path']}_9.pth")
-    # breakpoint()
-    train_args = sdict["args"]
+    sdict = torch.load(f"chkpt/{save_path}.pth")
+    args = sdict["args"]
+    train_args = args["train"]
     h_ks = [
         min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
         for idx in range(args["num_blocks"])
@@ -23,7 +21,7 @@ def main():
             ODEFuncBlock(
                 h_ks[idx], NN(device), args["sigma_0"] / args["d"], ode_solver="rk4", device=device
             )
-            for idx in range(train_args["num_blocks"])
+            for idx in range(args["num_blocks"])
         ]
     ).to(device)
     flow.load_state_dict(sdict["model"])
