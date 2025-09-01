@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
 from PIL import Image
 import numpy as np
 import yaml
@@ -7,6 +8,7 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset
 import os
 import torchdiffeq as tdeq
 import matplotlib.pyplot as plt
+import time
 
 
 class NN(nn.Module):
@@ -55,24 +57,28 @@ class ODEFuncBlock(nn.Module):
         self.device = device
         self.n_eps = n_eps
 
-    def _fd_div_at(self, x, t):
-        """Finite difference hutchinson divergence at(x,t). Returns (B,1)"""
+    def _fd_div_at(self, x, t, f_m=None):
+        """Finite difference hutchinson divergence at(x,t). Returns (B,1)
+            f_m is if already evaluated f(x, t)
+        """
         assert len(self._eps_cache) != 0, "need to call _prepare_eps"
         with torch.no_grad():
             rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
-        sigma = max(1e-4, (self.sigma if self.sigma > 0 else 1e-2) * rms.item())
+        sigma_base = self.sigma if self.sigma > 0 else 1e-2
+        sigma = torch.maximum(torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base)
 
         acc = 0.0
         for eps in self._eps_cache:
             f_p = self.model(x + sigma * eps, t)  # (B, D)
-            f_m = self.model(x - sigma * eps, t)
+            if f_m is None:
+                f_m = self.model(x, t)
 
-            jvp = (f_p - f_m) / (2 * sigma)  # J_f @ e
+            jvp = (f_p - f_m) / (sigma)  # J_f @ e
             acc += (jvp * eps).sum(dim=-1)
         return acc / len(self._eps_cache)
 
     def _prepare_eps(self, x, n_eps):
-        """constant eps across tdeq odeint"""
+        """Cache constant eps to use across tdeq ode integral"""
         eps_list = []
         for _ in range(n_eps):
             eps = torch.randn_like(x)
@@ -83,7 +89,7 @@ class ODEFuncBlock(nn.Module):
         """torchdiffeq expects (t,state) where state = (x, logdet, jacint)"""
         x, logdet, _ = state
         vfield = self.model(x, t)
-        div = self._fd_div_at(x, t)
+        div = self._fd_div_at(x, t, f_m=vfield)
 
         dlogdet_dt = -div
         djac_dt = torch.zeros_like(logdet)
@@ -114,23 +120,22 @@ class JKO(nn.Module):
         self.block_length = len(blocks)
 
     def forward(self, x, t, block_idx=None, reverse=False):
-        out, div_f = None, None
         if block_idx is None:
             block_order = self.blocks if not reverse else reversed(self.blocks)
             for block in block_order:
                 x, div_f, _ = block(x, t, reverse)
             return x, None
-        else:
-            out, div_f, _ = self.blocks[block_idx](x, t, reverse)
-            return out, div_f
+
+        out, div_f, _ = self.blocks[block_idx](x, t, reverse)
+        return out, div_f
     
     def __len__(self):
         return self.block_length
 
 
-def sample_points_from_image(image_path, num_points=100000):
+def sample_points_from_image(image_path, num_points=10000):
     """
-    Data generation of distribution from image.
+    Data generation of distribution from image, fit to [-4,4].
     Taken from https://github.com/hamrel-cxu/JKO-iFlow
     """
     image = Image.open(image_path)
@@ -160,24 +165,22 @@ def train_flow(
     args: dict,
     device="cpu",
 ):
-    """train block by block"""
+    """Train CNF block by block"""
     train_args = args["train"]
 
-    prev_points = [None for _ in range(len(train_dataset))]
-
+    prev_points: list[Tensor] = [None for _ in range(len(train_dataset))] # (epochs, num_points, D)
+    for epoch_idx, points in enumerate(train_dataset):
+        prev_points[epoch_idx] = points.to(device)
 
     for block_idx in range(flow.block_length):
+        start_time = time.time()
         block = flow.blocks[block_idx]
         optimizer = torch.optim.Adam(block.parameters(), lr=train_args["lr"])
 
-        for epoch_idx, points in enumerate(train_dataset):
-            epoch_data_loader = DataLoader(train_dataset, train_args["batch_size"])
-            prev_points = []
-            for points in epoch_data_loader:
-                prev_points.append(points)
+        for epoch_idx, points in enumerate(prev_points):
+            epoch_data_loader = DataLoader(points, train_args["batch_size"])
 
-            for batch_idx, batch in enumerate(prev_points):
-                batch = batch.to(device)
+            for batch_idx, batch in enumerate(epoch_data_loader):
                 optimizer.zero_grad()
                 out, div_f = flow(batch, t=0, block_idx=block_idx)
 
@@ -196,9 +199,13 @@ def train_flow(
                         f"block {block_idx} total: {loss.item():.2f} V_loss: {V_loss.item():.2f} W_loss: {W_loss.item():.2f} div: {div_loss.item():.2f}"
                     )
 
-        for batch_idx, batch in enumerate(prev_points):
+        
+        for epoch_idx, batch in enumerate(prev_points):
             with torch.no_grad():
-                prev_points[batch_idx], _ = flow(batch, t=0, block_idx=block_idx)
+                new_points, _ = flow(batch, t=0, block_idx=block_idx)
+                prev_points[epoch_idx] = new_points.detach()
+        
+        print(f"Block training finished in {time.time() - start_time:.2f} seconds")
 
         # save block parameters
         sdict = {
@@ -209,20 +216,20 @@ def train_flow(
         os.makedirs("chkpt", exist_ok=True)
         torch.save(sdict, f"chkpt/{train_args['save_path']}_{block_idx}.pth")
         plt.scatter(
-            batches[0][:, 0].cpu().detach().numpy(),
-            batches[0][:, 1].cpu().detach().numpy(),
+            prev_points[0][:, 0].cpu().detach().numpy(),
+            prev_points[0][:, 1].cpu().detach().numpy(),
         )
         plt.savefig(f"assets/block_{block_idx}.png")
         plt.close()
 
 def reparameterize_trajectory(model: JKO, points: torch.Tensor, num_iters = 1, ema_parameter: float = 0.3, h_max: float = 5):
-    """Trajectory reparameterization as written in B.3.1"""
+    """Trajectory reparameterization as written in Section B.3.1"""
     assert 0 < ema_parameter and ema_parameter < 1, "ema parameter eta must be in (0,1)"
     for iter in range(num_iters):
         arc_lengths = []
         prev_points: torch.Tensor = points # (B, D)
         for idx, block in enumerate(model.blocks):
-            cur_points, _ = model(prev_points, idx) # (B, D)
+            cur_points, _ = model(prev_points, t=0.0, block_idx = idx) # (B, D)
             norms = torch.norm(cur_points - prev_points, dim=-1) # (B,)
             arc_lengths.append(norms.mean())
             prev_points = cur_points
@@ -233,7 +240,7 @@ def reparameterize_trajectory(model: JKO, points: torch.Tensor, num_iters = 1, e
         for block, h_k in zip(model.blocks, new_hk):
             block.h_k = h_k
         print(f"mean arc length {mean_arc} std {arc_lengths.std()}")
-    # TODO: Train free block in Algo 1 after reparameterize
+    # TODO: do we need to train a free block at end?
 
 
 class ResamplingDataset(IterableDataset):

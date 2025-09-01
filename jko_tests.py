@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import os
 import yaml
-from flow import JKO, ODEFuncBlock, NN, sample_points_from_image
+from flow import JKO, ODEFuncBlock, NN, sample_points_from_image, reparameterize_trajectory
 import matplotlib.pyplot as plt
 
-
 def main():
-    save_path = "train_1"
+    save_path = "train_1_7"
     device = ("cuda" if torch.cuda.is_available() else "cpu")
     sdict = torch.load(f"chkpt/{save_path}.pth")
     args = sdict["args"]
@@ -26,7 +25,7 @@ def main():
     ).to(device)
     flow.load_state_dict(sdict["model"])
 
-    num_points = 500
+    num_points = 5000
     # points = torch.randn((num_points, 2))
     # p_x, _ = flow(points, 0, None, True)
     # plt.scatter(x=p_x[:, 0].detach().numpy(), y=p_x[:, 1].detach().numpy())
@@ -38,11 +37,10 @@ def main():
         for idx, block in reversed(list(enumerate(flow.blocks))):
             p_z = points
             
-            plt.scatter(x=p_z[:, 0].cpu().detach().numpy(), y=p_z[:, 1].cpu().detach().numpy())
+            plt.scatter(x=p_z[:, 0].cpu().detach().numpy(), y=p_z[:, 1].cpu().detach().numpy(), s=5, alpha=0.3)
             plt.title(f"block idx: {idx}")
             plt.savefig(f'plot_{idx}.png')
-            plt.show()
-            plt.clf()
+            plt.close()
             p_x, _, _ = block(points, reverse=True)
 
             points = p_x
