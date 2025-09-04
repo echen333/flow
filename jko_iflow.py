@@ -112,8 +112,12 @@ class ODEFuncBlock(nn.Module):
 class JKO(nn.Module):
     def __init__(self, blocks: list[ODEFuncBlock]):
         super().__init__()
+        if len(blocks) == 0:
+            raise ValueError("Length of blocks cannot be zero.")
+
         self.blocks = nn.ModuleList(blocks)
         self.block_length = len(blocks)
+        self.device = self.blocks[0].device
 
     def forward(self, x, t, block_idx=None, reverse=False):
         if block_idx is None:
