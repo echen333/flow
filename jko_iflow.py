@@ -9,6 +9,7 @@ import os
 import torchdiffeq as tdeq
 import matplotlib.pyplot as plt
 import time
+from operator import itemgetter
 
 
 class NN(nn.Module):
@@ -59,12 +60,14 @@ class ODEFuncBlock(nn.Module):
 
     def _fd_div_at(self, x, t, f_m=None):
         """Finite difference hutchinson divergence at(x,t). Returns (B,1)
-            f_m is if already evaluated f(x, t)
+        f_m is if already evaluated f(x, t)
         """
         with torch.no_grad():
             rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
         sigma_base = self.sigma if self.sigma > 0 else 1e-2
-        sigma = torch.maximum(torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base)
+        sigma = torch.maximum(
+            torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base
+        )
 
         acc = 0.0
         self._eps_cache = [torch.randn_like(x) for _ in range(self.n_eps)]
@@ -89,7 +92,9 @@ class ODEFuncBlock(nn.Module):
 
     def forward(self, x0, t=0.0, reverse=False):
         t_start, t_end = float(t), float(t) + float(self.h_k)
-        t_grid = torch.linspace(t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device)
+        t_grid = torch.linspace(
+            t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device
+        )
         if reverse:
             t_grid = t_grid.flip(0)
 
@@ -119,9 +124,30 @@ class JKO(nn.Module):
 
         out, div_f, _ = self.blocks[block_idx](x, t, reverse)
         return out, div_f
-    
+
     def __len__(self):
         return self.block_length
+
+    def get_total_time(self):
+        return sum([block.h_k for block in self.blocks])
+
+
+def get_JKO(h_0, h_max, rho, num_blocks, sigma_0, d, device="cpu"):
+    h_ks = [min(h_max, h_0 * (rho**idx)) for idx in range(num_blocks)]
+    method = "rk4"
+    flow = JKO(
+        [
+            ODEFuncBlock(
+                h_ks[idx],
+                NN(device),
+                sigma_0 / np.sqrt(d),
+                device=device,
+                ode_solver=method,
+            )
+            for idx in range(num_blocks)
+        ]
+    )
+    return flow
 
 
 def sample_points_from_image(image_path, num_points=10000):
@@ -153,23 +179,28 @@ def sample_points_from_image(image_path, num_points=10000):
 def train_flow(
     flow: JKO,
     train_dataset: IterableDataset,
-    args: dict,
+    *,
+    lr: float,
+    batch_size: int,
+    clip_grad: bool,
+    save_path: str,
     device="cpu",
 ):
     """Train CNF block by block"""
-    train_args = args["train"]
 
-    prev_points: list[Tensor] = [None for _ in range(len(train_dataset))] # (epochs, num_points, D)
+    prev_points: list[Tensor] = [
+        None for _ in range(len(train_dataset))
+    ]  # (epochs, num_points, D)
     for epoch_idx, points in enumerate(train_dataset):
         prev_points[epoch_idx] = points.to(device)
 
     for block_idx in range(flow.block_length):
         start_time = time.time()
         block = flow.blocks[block_idx]
-        optimizer = torch.optim.Adam(block.parameters(), lr=train_args["lr"])
+        optimizer = torch.optim.Adam(block.parameters(), lr=lr)
 
         for epoch_idx, points in enumerate(prev_points):
-            epoch_data_loader = DataLoader(points, train_args["batch_size"])
+            epoch_data_loader = DataLoader(points, batch_size)
 
             for batch_idx, batch in enumerate(epoch_data_loader):
                 optimizer.zero_grad()
@@ -182,7 +213,7 @@ def train_flow(
                 loss = V_loss + div_loss + W_loss
 
                 loss.backward()
-                if train_args["clip_grad"]:
+                if clip_grad:
                     torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
                 optimizer.step()
                 if (epoch_idx + 1) % 50 == 0:
@@ -190,22 +221,23 @@ def train_flow(
                         f"block {block_idx} total: {loss.item():.2f} V_loss: {V_loss.item():.2f} W_loss: {W_loss.item():.2f} div: {div_loss.item():.2f}"
                     )
 
-        
         for epoch_idx, batch in enumerate(prev_points):
             with torch.no_grad():
                 new_points, _ = flow(batch, t=0, block_idx=block_idx)
                 prev_points[epoch_idx] = new_points.detach()
-        
+
         print(f"Block training finished in {time.time() - start_time:.2f} seconds")
 
         # save block parameters
+        arg_vars = ("lr", "batch_size", "clip_grad", "save_path", "device")
+        args = {k: locals()[k] for k in arg_vars}
         sdict = {
             "model": flow.state_dict(),
             "optimizer": optimizer.state_dict(),
             "args": args,
         }
         os.makedirs("chkpt", exist_ok=True)
-        torch.save(sdict, f"chkpt/{train_args['save_path']}_{block_idx}.pth")
+        torch.save(sdict, f"chkpt/{save_path}_{block_idx}.pth")
         plt.scatter(
             prev_points[0][:, 0].cpu().detach().numpy(),
             prev_points[0][:, 1].cpu().detach().numpy(),
@@ -213,21 +245,31 @@ def train_flow(
         plt.savefig(f"assets/block_{block_idx}.png")
         plt.close()
 
-def reparameterize_trajectory(model: JKO, points: torch.Tensor, num_iters = 1, ema_parameter: float = 0.3, h_max: float = 5):
+
+def reparameterize_trajectory(
+    model: JKO,
+    points: torch.Tensor,
+    num_iters=1,
+    ema_parameter: float = 0.3,
+    h_max: float = 5,
+):
     """Trajectory reparameterization as written in Section B.3.1"""
     assert 0 < ema_parameter and ema_parameter < 1, "ema parameter eta must be in (0,1)"
     for iter in range(num_iters):
         arc_lengths = []
-        prev_points: torch.Tensor = points # (B, D)
+        prev_points: torch.Tensor = points  # (B, D)
         for idx, block in enumerate(model.blocks):
-            cur_points, _ = model(prev_points, t=0.0, block_idx = idx) # (B, D)
-            norms = torch.norm(cur_points - prev_points, dim=-1) # (B,)
+            cur_points, _ = model(prev_points, t=0.0, block_idx=idx)  # (B, D)
+            norms = torch.norm(cur_points - prev_points, dim=-1)  # (B,)
             arc_lengths.append(norms.mean())
             prev_points = cur_points
         arc_lengths = torch.tensor(arc_lengths).cpu().numpy()
         mean_arc = np.mean(arc_lengths)
         old_hk = np.array([block.h_k for block in model.blocks])
-        new_hk = np.minimum(old_hk + ema_parameter * (mean_arc * old_hk / arc_lengths - old_hk), h_max * np.ones_like(old_hk))
+        new_hk = np.minimum(
+            old_hk + ema_parameter * (mean_arc * old_hk / arc_lengths - old_hk),
+            h_max * np.ones_like(old_hk),
+        )
         for block, h_k in zip(model.blocks, new_hk):
             block.h_k = h_k
         print(f"mean arc length {mean_arc} std {arc_lengths.std()}")
@@ -243,11 +285,10 @@ class ResamplingDataset(IterableDataset):
 
     def __len__(self):
         return self.num_epochs
-    
+
     def __iter__(self):
         for _ in range(self.num_epochs):
             yield self.sampling_fn().to(self.device)
-
 
 
 def main():
@@ -267,20 +308,50 @@ def main():
     method = "rk4"
     flow = JKO(
         [
-            ODEFuncBlock(h_ks[idx], NN(device), args["sigma_0"] / np.sqrt(args["d"]), device=device, ode_solver=method)
+            ODEFuncBlock(
+                h_ks[idx],
+                NN(device),
+                args["sigma_0"] / np.sqrt(args["d"]),
+                device=device,
+                ode_solver=method,
+            )
             for idx in range(args["num_blocks"])
         ]
     )
 
     points = points.to(device=device)
     train_args = args["train"]
-    train_dataset = ResamplingDataset(lambda: sample_points_from_image(args["image_path"], args["train"]["num_points"]), train_args["epochs_per_block"], "cpu")
-    train_flow(flow, train_dataset, args, device=device)
+    train_dataset = ResamplingDataset(
+        lambda: sample_points_from_image(
+            args["image_path"], args["train"]["num_points"]
+        ),
+        train_args["epochs_per_block"],
+        "cpu",
+    )
+    lr, batch_size, clip_grad, save_path = itemgetter(
+        "lr", "batch_size", "clip_grad", "save_path"
+    )(args["train"])
+    print("training flow...")
+    train_flow(
+        flow,
+        train_dataset,
+        lr=lr,
+        batch_size=batch_size,
+        clip_grad=clip_grad,
+        save_path=save_path,
+    )
     print(f"h_k before {[block.h_k for block in flow.blocks]}")
     reparameterize_trajectory(flow, points, 10, args["ema_parameter"], args["h_max"])
     h_ks = [block.h_k for block in flow.blocks]
     print(f"h_k after {h_ks}")
-    train_flow(flow, train_dataset, args, device=device)
+    train_flow(
+        flow,
+        train_dataset,
+        lr=lr,
+        batch_size=batch_size,
+        clip_grad=clip_grad,
+        save_path=save_path,
+    )
 
     sdict = {
         "model": flow.state_dict(),
