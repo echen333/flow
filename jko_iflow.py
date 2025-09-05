@@ -182,7 +182,8 @@ def sample_points_from_image(image_path, num_points=10000):
 
 def train_flow(
     flow: JKO,
-    train_dataset: IterableDataset,
+    train_dataset: Tensor,
+    num_epochs: int,
     *,
     lr: float,
     batch_size: int,
@@ -192,20 +193,15 @@ def train_flow(
 ):
     """Train CNF block by block"""
 
-    prev_points: list[Tensor] = [
-        None for _ in range(len(train_dataset))
-    ]  # (epochs, num_points, D)
-    for epoch_idx, points in enumerate(train_dataset):
-        prev_points[epoch_idx] = points.to(device)
+    prev_points: Tensor = train_dataset # (N,D)
 
     for block_idx in range(flow.block_length):
         start_time = time.time()
         block = flow.blocks[block_idx]
         optimizer = torch.optim.Adam(block.parameters(), lr=lr)
 
-        for epoch_idx, points in enumerate(prev_points):
-            epoch_data_loader = DataLoader(points, batch_size)
-
+        epoch_data_loader = DataLoader(prev_points, batch_size)
+        for epoch_idx in range(num_epochs):
             for batch_idx, batch in enumerate(epoch_data_loader):
                 optimizer.zero_grad()
                 out, div_f = flow(batch, t=0, block_idx=block_idx)
@@ -225,16 +221,24 @@ def train_flow(
                         f"block {block_idx} total: {loss.item():.2f} V_loss: {V_loss.item():.2f} W_loss: {W_loss.item():.2f} div: {div_loss.item():.2f}"
                     )
 
-        for epoch_idx, batch in enumerate(prev_points):
+        pushed_batches = []
+        flow.eval()
+        for batch in epoch_data_loader:
             with torch.no_grad():
                 new_points, _ = flow(batch, t=0, block_idx=block_idx)
-                prev_points[epoch_idx] = new_points.detach()
+                pushed_batches.append(new_points.detach())
 
+        prev_points = torch.concat(pushed_batches)
+        flow.train()
         print(f"Block training finished in {time.time() - start_time:.2f} seconds")
 
         # save block parameters
-        arg_vars = ("lr", "batch_size", "clip_grad", "save_path", "device")
-        args = {k: locals()[k] for k in arg_vars}
+        args = {
+            "lr": lr,
+            "batch_size": batch_size,
+            "save_path": save_path,
+            "device": device
+        }
         sdict = {
             "model": flow.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -243,8 +247,8 @@ def train_flow(
         os.makedirs("chkpt", exist_ok=True)
         torch.save(sdict, f"chkpt/{save_path}_{block_idx}.pth")
         plt.scatter(
-            prev_points[0][:, 0].cpu().detach().numpy(),
-            prev_points[0][:, 1].cpu().detach().numpy(),
+            prev_points[:, 0].cpu().detach().numpy(),
+            prev_points[:, 1].cpu().detach().numpy(),
         )
         plt.savefig(f"assets/block_{block_idx}.png")
         plt.close()

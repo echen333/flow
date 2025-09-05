@@ -10,10 +10,11 @@ from typing import Callable
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from torch import Tensor
 
 
 def init_and_train_jkos(
-    P_data: IterableDataset, Q_data: IterableDataset, device: str, *, args
+    P_data: Tensor, Q_data: Tensor, device: str, *, args
 ) -> tuple[JKO, JKO]:
     """Initialize and generate warmstart for two JKO-scheme models that translate from P -> N(O,I) -> Q
 
@@ -54,6 +55,7 @@ def init_and_train_jkos(
     train_flow(
         jko1,
         P_data,
+        num_epochs=5,
         lr=lr,
         batch_size=batch_size,
         clip_grad=clip_grad,
@@ -62,6 +64,7 @@ def init_and_train_jkos(
     train_flow(
         jko2,
         Q_data,
+        num_epochs=5,
         lr=lr,
         batch_size=batch_size,
         clip_grad=clip_grad,
@@ -74,38 +77,44 @@ def init_and_train_jkos(
     return jko1, jko2
 
 
-def update_classifier(classifier: nn.Module, clf_optim, X, y):
+def update_classifier(classifier: nn.Module, clf_optim, X, y) -> float:
     clf_optim.zero_grad()
 
     logits = classifier(X).squeeze(-1)
     clf_loss = F.binary_cross_entropy_with_logits(logits, y)
     clf_loss.backward()
     clf_optim.step()
+    return clf_loss.item()
 
 
 def train_OT_Flow(
     model: OTFlow,
     classifier1: nn.Module,
     classifier2: nn.Module,
-    P_data: IterableDataset,
-    Q_data: IterableDataset,
+    P_sample: Tensor,
+    Q_sample: Tensor,
     *,
     device: str = "cpu",
-    tot_iters: int = 10,
+    Tot: int = 2,
     lr: float = 3e-4,
     clf_lr: float = 3e-4,
     E: int = 20,
     E_0: int = 20,
     E_in: int = 5,
     gamma: float = 1,
+    optim_cls = torch.optim.AdamW
 ) -> None:
-    ot_optim = torch.optim.AdamW(model.parameters(), lr=lr)
-    clf1_optim = torch.optim.AdamW(classifier1.parameters(), lr=clf_lr)
-    clf2_optim = torch.optim.AdamW(classifier2.parameters(), lr=clf_lr)
+    ot_optim = optim_cls(model.parameters(), lr=lr)
+    clf1_optim = optim_cls(classifier1.parameters(), lr=clf_lr)
+    clf2_optim = optim_cls(classifier2.parameters(), lr=clf_lr)
+
+    wandb.define_metric("global_step")
+    wandb.define_metric("epoch")
+    global_step = 0
 
     # so P_data and Q_data just gives samples as in a minibatch
     # and we update all params after
-    for iter_index, (P_sample, Q_sample) in enumerate(zip(P_data, Q_data)):
+    for iter_index in range(Tot):
         N, D = P_sample.shape
         M, D2 = Q_sample.shape
         if D != D2:
@@ -116,7 +125,6 @@ def train_OT_Flow(
         y = torch.concat([torch.zeros(N, device=device), torch.ones(M, device=device)])
         if iter_index == 0:
             for clf_epoch in range(E_0):
-                print(f"starting epoch {clf_epoch}")
                 update_classifier(classifier1, clf1_optim, X, y)
 
         for epoch in range(E):
@@ -127,24 +135,36 @@ def train_OT_Flow(
             KL_loss = -classifier1(Q_hat).mean()
             W2_loss = model.get_W2_loss(P_sample, reverse=False)
             loss = KL_loss + gamma * W2_loss
-            # breakpoint()
             loss.backward()
             ot_optim.step()
 
             classifier1.train()
 
             # fit classifier 1 on new OT model
+            clf_losses = []
             for _ in range(E_in):
                 Q_hat = model(P_sample).detach()
                 X = torch.concat([Q_hat, Q_sample])
                 y = torch.concat(
                     [torch.zeros(N, device=device), torch.ones(M, device=device)]
                 )
-                update_classifier(classifier1, clf1_optim, X, y)
+                clf_loss = update_classifier(classifier1, clf1_optim, X, y)
+                clf_losses.append(clf_loss)
+
+            wandb_log = {
+                "global_step": global_step,
+                "epoch": epoch,
+                "iter_index": iter_index,
+                "loss": loss.item(),
+                "KL_loss": KL_loss.item(),
+                "W2_loss": W2_loss.item(),
+                "clf_losses": clf_losses[-1],
+                "grad_norm": next(model.parameters()).grad.data.norm(2).item()
+            }
+            global_step += 1
+            wandb.log(wandb_log)
 
         # now do the loss in reverse to go from Q -> P
-        wandb_log = {}
-        wandb.log(wandb_log)
 
 
 def main():
@@ -155,15 +175,9 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     P_mu, P_sigma = torch.tensor([5, 5]), 1
-
-    num_epochs = 100
-    P_data = ResamplingDataset(
-        lambda: get_gaussian(P_mu, P_sigma, args["N"], device), num_epochs, device
-    )
+    P_data = get_gaussian(P_mu, P_sigma, args["N"], device)
     Q_mu, Q_sigma = torch.tensor([-5, 5]), 2
-    Q_data = ResamplingDataset(
-        lambda: get_gaussian(Q_mu, Q_sigma, args["M"], device), num_epochs, device
-    )
+    Q_data = get_gaussian(Q_mu, Q_sigma, args["M"], device)
 
     save_path = "chkpt/ot_flow_jko1_2.pt"
     if not args["load_JKO"]:
@@ -176,17 +190,18 @@ def main():
     otflow = OTFlow(jko1=jko1, jko2=jko2)
     tot_iters, lr, clf_lr = itemgetter("tot_iters", "lr", "clf_lr")(args["ot_train"])
     tot_iters, lr, clf_lr = int(tot_iters), float(lr), float(clf_lr)
-    P_data.num_epochs = tot_iters
-    Q_data.num_epochs = tot_iters
 
     dim = args["jko"]["d"]
+    clf1 = BasicClassifier(dim).to(device)
+    clf2 = BasicClassifier(dim).to(device)
     train_OT_Flow(
         otflow,
-        BasicClassifier(dim),
-        BasicClassifier(dim),
-        P_data=P_data,
-        Q_data=Q_data,
-        tot_iters=tot_iters,
+        clf1,
+        clf2,
+        P_sample=P_data,
+        Q_sample=Q_data,
+        device=device,
+        Tot=2,
         lr=lr,
         clf_lr=clf_lr,
     )
