@@ -2,3 +2,4 @@
 chkpt/
 wandb/
 *.pyc
+dbg/

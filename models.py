@@ -31,28 +31,30 @@ class ODEFunction(nn.Module):
 
 
 class OTFlow(nn.Module):
+    """OTFlow, doesn't really have the same memory efficiency as JKO"""
+    
     def __init__(self, jko1: JKO, jko2: JKO):
         super().__init__()
         self.jko1 = jko1
         self.jko2 = jko2
         self.device = jko1.device
 
-    def forward(self, x, t=0.0, reverse=False):
-        if not reverse:
-            x1, _ = self.jko1(x, t)
-            t1 = self.jko1.get_total_time()
-            x2, _ = self.jko2(x1, t1, reverse=True)
-        else:
-            x1, _ = self.jko2(x, t)
-            t1 = self.jko2.get_total_time()
-            x2, _ = self.jko1(x1, t1, reverse=True)
-        return x2
-
-    def get_W2_loss(self, points: Tensor, reverse=False):
-        prev_points = points
+    def get_blocks(self, reverse=False) -> list[ODEFuncBlock]:
         blocks: list[ODEFuncBlock] = chain(self.jko1.blocks, reversed(self.jko2.blocks))
         if reverse:
             blocks = reversed(list(blocks))
+        return blocks
+
+    def forward(self, x, t=0.0, reverse=False):
+        blocks = self.get_blocks(reverse)
+        for idx, block in enumerate(blocks):
+            is_reverse = (idx >= len(self.jko1))
+            x, _, _ = block(x, reverse=is_reverse)
+        return x
+
+    def get_W2_loss(self, points: Tensor, reverse=False):
+        prev_points = points
+        blocks = self.get_blocks(reverse)
 
         W2_dists = torch.zeros(points.shape[0], device=self.device)
         for block in blocks:
@@ -64,16 +66,17 @@ class OTFlow(nn.Module):
 
 
 class BasicClassifier(nn.Module):
-    def __init__(self, in_dim):
+    def __init__(self, in_dim, device):
         super().__init__()
         # might need some regularization
+        self.device = device
         self.model = nn.Sequential(
             nn.Linear(in_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
-        )
+        ).to(device)
 
     def forward(self, x):
         return self.model(x)

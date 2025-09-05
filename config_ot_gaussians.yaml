@@ -4,7 +4,7 @@ jko:
   h_max: 5
   d: 2
   sigma_0: 0.02
-  num_blocks: 3
+  num_blocks: 8
 jko_train:
   num_points: 10000
   epochs_per_block: 100
@@ -13,9 +13,14 @@ jko_train:
   lr: 0.0001
   save_path: train_2
 ot_train:
-  lr: 3e-4
-  clf_lr: 3e-4
-  tot_iters: 10
-N: 512
-M: 512
+  batch_size: 8192
+  lr: 1e-4
+  clf_lr: 1e-4
+  Tot: 2
+  E: 50
+  E_0: 300
+  E_in: 4
+  gamma: 0.5
+N: 8192
+M: 8192
 load_JKO: True
