@@ -1,9 +1,132 @@
 import torch
 import torch.nn as nn
-from jko_iflow import JKO, ODEFuncBlock
 from typing import Sequence, Callable
 from itertools import chain
 from torch import Tensor
+
+
+class NN(nn.Module):
+    def __init__(self, device):
+        super(NN, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 128),
+            nn.Softplus(beta=20, threshold=20),
+            nn.Linear(128, 2),
+        ).to(device=device)
+
+    def forward(self, x, t):
+        return self.layers(x)
+
+
+class ODEFuncBlock(nn.Module):
+    def __init__(
+        self,
+        h_k,
+        model: nn.Module,
+        sigma: float,
+        use_fd=False,
+        ode_solver="rk4",
+        device="cpu",
+        n_eps=1,
+    ):
+        """ODE block using model, time independent
+
+        Args:
+            h_k (int): number of split steps
+            model (nn.Module): model for f
+            sigma (float): finite difference sigma
+            use_fd (bool, optional): use finite difference. Defaults to False.
+        """
+        super().__init__()
+        self.model = model
+        self.h_steps = 3
+        self.h_k = h_k
+        self.sigma = sigma
+        self.use_fd = use_fd
+        self.ode_solver = ode_solver
+        self.device = device
+        self.n_eps = n_eps
+
+    def _fd_div_at(self, x, t, f_m=None):
+        """Finite difference hutchinson divergence at(x,t). Returns (B,1)
+        f_m is if already evaluated f(x, t)
+        """
+        with torch.no_grad():
+            rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
+        sigma_base = self.sigma if self.sigma > 0 else 1e-2
+        sigma = torch.maximum(
+            torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base
+        )
+
+        acc = 0.0
+        self._eps_cache = [torch.randn_like(x) for _ in range(self.n_eps)]
+        for eps in self._eps_cache:
+            f_p = self.model(x + sigma * eps, t)  # (B, D)
+            if f_m is None:
+                f_m = self.model(x, t)
+
+            jvp = (f_p - f_m) / (sigma)  # J_f @ e
+            acc += (jvp * eps).sum(dim=-1)
+        return acc / len(self._eps_cache)
+
+    def _rhs(self, t, state):
+        """torchdiffeq expects (t,state) where state = (x, logdet, jacint)"""
+        x, logdet, _ = state
+        vfield = self.model(x, t)
+        div = self._fd_div_at(x, t, f_m=vfield)
+
+        dlogdet_dt = -div
+        djac_dt = torch.zeros_like(logdet)
+        return (vfield, dlogdet_dt, djac_dt)
+
+    def forward(self, x0, t=0.0, reverse=False):
+        t_start, t_end = float(t), float(t) + float(self.h_k)
+        t_grid = torch.linspace(
+            t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device
+        )
+        if reverse:
+            t_grid = t_grid.flip(0)
+
+        B, D = x0.shape
+        logdet0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
+        jac0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
+
+        xT, logdetT, jacT = tdeq.odeint(
+            self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
+        )
+
+        return xT[-1], logdetT[-1], jacT[-1]
+
+
+class JKO(nn.Module):
+    def __init__(self, blocks: list[ODEFuncBlock]):
+        super().__init__()
+        if len(blocks) == 0:
+            raise ValueError("Length of blocks cannot be zero.")
+
+        self.blocks = nn.ModuleList(blocks)
+        self.block_length = len(blocks)
+        self.device = self.blocks[0].device
+
+    def forward(self, x, t, block_idx=None, reverse=False):
+        if block_idx is None:
+            block_order = self.blocks if not reverse else reversed(self.blocks)
+            for block in block_order:
+                x, div_f, _ = block(x, t, reverse)
+            return x, None
+
+        out, div_f, _ = self.blocks[block_idx](x, t, reverse)
+        return out, div_f
+
+    def __len__(self):
+        return self.block_length
+
+    def get_total_time(self):
+        return sum([block.h_k for block in self.blocks])
 
 
 class ODEFunction(nn.Module):
@@ -32,7 +155,7 @@ class ODEFunction(nn.Module):
 
 class OTFlow(nn.Module):
     """OTFlow, doesn't really have the same memory efficiency as JKO"""
-    
+
     def __init__(self, jko1: JKO, jko2: JKO):
         super().__init__()
         self.jko1 = jko1
@@ -48,7 +171,7 @@ class OTFlow(nn.Module):
     def forward(self, x, t=0.0, reverse=False):
         blocks = self.get_blocks(reverse)
         for idx, block in enumerate(blocks):
-            is_reverse = (idx >= len(self.jko1))
+            is_reverse = idx >= len(self.jko1)
             x, _, _ = block(x, reverse=is_reverse)
         return x
 

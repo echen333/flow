@@ -10,130 +10,8 @@ import torchdiffeq as tdeq
 import matplotlib.pyplot as plt
 import time
 from operator import itemgetter
-
-
-class NN(nn.Module):
-    def __init__(self, device):
-        super(NN, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(2, 128),
-            nn.Softplus(beta=20, threshold=20),
-            nn.Linear(128, 128),
-            nn.Softplus(beta=20, threshold=20),
-            nn.Linear(128, 128),
-            nn.Softplus(beta=20, threshold=20),
-            nn.Linear(128, 2),
-        ).to(device=device)
-
-    def forward(self, x, t):
-        return self.layers(x)
-
-
-class ODEFuncBlock(nn.Module):
-    def __init__(
-        self,
-        h_k,
-        model: nn.Module,
-        sigma: float,
-        use_fd=False,
-        ode_solver="rk4",
-        device="cpu",
-        n_eps=1,
-    ):
-        """ODE block using model, time independent
-
-        Args:
-            h_k (int): number of split steps
-            model (nn.Module): model for f
-            sigma (float): finite difference sigma
-            use_fd (bool, optional): use finite difference. Defaults to False.
-        """
-        super().__init__()
-        self.model = model
-        self.h_steps = 3
-        self.h_k = h_k
-        self.sigma = sigma
-        self.use_fd = use_fd
-        self.ode_solver = ode_solver
-        self.device = device
-        self.n_eps = n_eps
-
-    def _fd_div_at(self, x, t, f_m=None):
-        """Finite difference hutchinson divergence at(x,t). Returns (B,1)
-        f_m is if already evaluated f(x, t)
-        """
-        with torch.no_grad():
-            rms = x.pow(2).mean().sqrt().clamp_min(1e-3)
-        sigma_base = self.sigma if self.sigma > 0 else 1e-2
-        sigma = torch.maximum(
-            torch.tensor(1e-4, device=x.device, dtype=x.dtype), rms * sigma_base
-        )
-
-        acc = 0.0
-        self._eps_cache = [torch.randn_like(x) for _ in range(self.n_eps)]
-        for eps in self._eps_cache:
-            f_p = self.model(x + sigma * eps, t)  # (B, D)
-            if f_m is None:
-                f_m = self.model(x, t)
-
-            jvp = (f_p - f_m) / (sigma)  # J_f @ e
-            acc += (jvp * eps).sum(dim=-1)
-        return acc / len(self._eps_cache)
-
-    def _rhs(self, t, state):
-        """torchdiffeq expects (t,state) where state = (x, logdet, jacint)"""
-        x, logdet, _ = state
-        vfield = self.model(x, t)
-        div = self._fd_div_at(x, t, f_m=vfield)
-
-        dlogdet_dt = -div
-        djac_dt = torch.zeros_like(logdet)
-        return (vfield, dlogdet_dt, djac_dt)
-
-    def forward(self, x0, t=0.0, reverse=False):
-        t_start, t_end = float(t), float(t) + float(self.h_k)
-        t_grid = torch.linspace(
-            t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device
-        )
-        if reverse:
-            t_grid = t_grid.flip(0)
-
-        B, D = x0.shape
-        logdet0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
-        jac0 = torch.zeros(B, device=self.device, dtype=x0.dtype)
-
-        xT, logdetT, jacT = tdeq.odeint(
-            self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
-        )
-
-        return xT[-1], logdetT[-1], jacT[-1]
-
-
-class JKO(nn.Module):
-    def __init__(self, blocks: list[ODEFuncBlock]):
-        super().__init__()
-        if len(blocks) == 0:
-            raise ValueError("Length of blocks cannot be zero.")
-
-        self.blocks = nn.ModuleList(blocks)
-        self.block_length = len(blocks)
-        self.device = self.blocks[0].device
-
-    def forward(self, x, t, block_idx=None, reverse=False):
-        if block_idx is None:
-            block_order = self.blocks if not reverse else reversed(self.blocks)
-            for block in block_order:
-                x, div_f, _ = block(x, t, reverse)
-            return x, None
-
-        out, div_f, _ = self.blocks[block_idx](x, t, reverse)
-        return out, div_f
-
-    def __len__(self):
-        return self.block_length
-
-    def get_total_time(self):
-        return sum([block.h_k for block in self.blocks])
+from data_gen import sample_points_from_image
+from models import JKO, ODEFuncBlock, NN
 
 
 def get_JKO(h_0, h_max, rho, num_blocks, sigma_0, d, device="cpu"):
@@ -154,32 +32,6 @@ def get_JKO(h_0, h_max, rho, num_blocks, sigma_0, d, device="cpu"):
     return flow
 
 
-def sample_points_from_image(image_path, num_points=10000):
-    """
-    Data generation of distribution from image, fit to [-4,4].
-    Taken from https://github.com/hamrel-cxu/JKO-iFlow
-    """
-    image = Image.open(image_path)
-    # not sure where transforms but grayscale image
-    image_mask = np.array(image.rotate(180).transpose(0).convert("L"))
-
-    w, h = image.size
-    x = np.linspace(-4, 4, w)
-    y = np.linspace(-4, 4, h)
-    xx, yy = np.meshgrid(x, y)
-    xx = np.reshape(xx, (-1, 1))
-    yy = np.reshape(yy, (-1, 1))
-    means = np.concatenate([xx, yy], 1)
-
-    img = image_mask.max() - image_mask
-    probs = img.reshape(-1) / img.sum()
-    std = np.array([8 / w / 2, 8 / h / 2])
-    inds = np.random.choice(int(probs.shape[0]), num_points, p=probs)
-    m = means[inds]
-    samples = np.random.randn(*m.shape) * std + m
-    return torch.tensor(samples, dtype=torch.float32)
-
-
 def train_flow(
     flow: JKO,
     train_dataset: Tensor,
@@ -193,7 +45,7 @@ def train_flow(
 ):
     """Train CNF block by block"""
 
-    prev_points: Tensor = train_dataset # (N,D)
+    prev_points: Tensor = train_dataset  # (N,D)
 
     for block_idx in range(flow.block_length):
         start_time = time.time()
@@ -237,7 +89,7 @@ def train_flow(
             "lr": lr,
             "batch_size": batch_size,
             "save_path": save_path,
-            "device": device
+            "device": device,
         }
         sdict = {
             "model": flow.state_dict(),
@@ -284,6 +136,7 @@ def reparameterize_trajectory(
     # TODO: do we need to train a free block at end?
 
 
+# TODO: Remove
 class ResamplingDataset(IterableDataset):
     def __init__(self, sampling_fn, num_epochs, device="cpu"):
         super().__init__()
@@ -343,6 +196,7 @@ def main():
     train_flow(
         flow,
         train_dataset,
+        num_epochs=train_args["epochs_per_block"],
         lr=lr,
         batch_size=batch_size,
         clip_grad=clip_grad,
@@ -355,6 +209,7 @@ def main():
     train_flow(
         flow,
         train_dataset,
+        num_epochs=train_args["epochs_per_block"],
         lr=lr,
         batch_size=batch_size,
         clip_grad=clip_grad,

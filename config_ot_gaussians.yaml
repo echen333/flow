@@ -24,3 +24,7 @@ ot_train:
 N: 8192
 M: 8192
 load_JKO: True
+data:
+  P_distribution: moons
+  Q_distribution: image
+  Q_image_path: img_checkerboard.png
