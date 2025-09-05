@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Sequence, Callable
 from itertools import chain
 from torch import Tensor
+import torchdiffeq as tdeq
 
 
 class NN(nn.Module):

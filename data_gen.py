@@ -58,5 +58,5 @@ def get_samples(
         mu, sigma = Tensor(kwargs[f"{prefix}_mu"]), float(kwargs[f"{prefix}_sigma"])
         return get_gaussian(mu, sigma, num_samples, device)
     if distribution == "image":
-        return sample_points_from_image(kwargs[f"{prefix}_image_path"], num_samples)
+        return sample_points_from_image(kwargs[f"{prefix}_image_path"], num_samples).to(device)
     raise ValueError(f"Distribution {distribution} is not valid")

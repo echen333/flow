@@ -16,7 +16,7 @@ from visualize_data import plot_two_distributions, visualize_otflow
 
 
 def init_and_train_jkos(
-    P_data: Tensor, Q_data: Tensor, device: str, *, args
+    P_data: Tensor, Q_data: Tensor, device: str, *, args, ot_save_path
 ) -> tuple[JKO, JKO]:
     """Initialize and generate warmstart for two JKO-scheme models that translate from P -> N(O,I) -> Q
 
@@ -74,14 +74,13 @@ def init_and_train_jkos(
     )
 
     save_obj = {"jko1": jko1, "jko2": jko2}
-    ot_save_path = "chkpt/ot_flow_jko1_2.pt"
     torch.save(save_obj, ot_save_path)
     return jko1, jko2
 
 
 def update_classifier(
     classifier: nn.Module, clf_optim, D_hat: Tensor, D_sample: Tensor
-) -> float:
+) -> Tensor:
     N, M = D_sample.shape[0], D_sample.shape[0]
     device = classifier.device
     X = torch.concat([D_hat, D_sample])
@@ -149,46 +148,49 @@ def train_OT_Flow(
     wandb.define_metric("epoch")
     global_step = 0
 
-    # so P_data and Q_data just gives samples as in a minibatch
-    # and we update all params after
     if P_data.shape[1] != Q_data.shape[1]:
         raise ValueError("Samples from P and Q must have the same dimension.")
 
+    print(f"Begin training of OTFlow")
     for iter_index in range(Tot):
+        # TODO: should not be using DataLoader because paying for CPU syncs
         P_data_loader = DataLoader(TensorDataset(P_data), batch_size, shuffle=True)
         Q_data_loader = DataLoader(TensorDataset(Q_data), batch_size, shuffle=True)
         assert len(P_data) == len(Q_data), "hmmm not necessarily right but placeholder"
 
         if iter_index == 0:
             start_time = time.time()
-            for _ in range(E_0):
+            for clf_step in range(E_0):
                 # Tensor Dataset returns a tuple so we have to take in as (P_sample, )
+                start_time2 = time.time()
                 for (P_sample,), (Q_sample,) in zip(P_data_loader, Q_data_loader):
                     Q_hat = model(P_sample, t=0.0).detach()
-                    update_classifier(classifier1, clf1_optim, Q_hat, Q_sample)
+                    clf_loss: Tensor = update_classifier(classifier1, clf1_optim, Q_hat, Q_sample)
+                    wandb.log({"init_clf_step": clf_step, "init_clf_loss": clf_loss.item()})
+                print(f"epoch took {time.time() - start_time2:.2f}s")
             print(f"initialization of clf0 took {time.time() - start_time}s")
 
         for epoch in range(E):
             first_data = True
 
+            print(f"starting epoch {epoch}")
             for (P_sample,), (Q_sample,) in zip(P_data_loader, Q_data_loader):
-                print(f"starting epoch {epoch}")
                 ot_optim.zero_grad()
 
-                Q_hat = model(P_sample, t=0.0).detach()
+                Q_hat = model(P_sample, t=0.0)
                 classifier1.eval()
                 KL_loss = -classifier1(Q_hat).mean()
                 classifier1.train()
-                W2_loss = gamma * model.get_W2_loss(P_sample, reverse=False)
-                loss = KL_loss + W2_loss
+                W2_loss = model.get_W2_loss(P_sample, reverse=False)
+                loss = KL_loss + gamma * W2_loss
                 loss.backward()
                 ot_optim.step()
 
-                if first_data:
+                if first_data and epoch % 5 == 0:
                     first_data = False
                     # lets plot Q_hat and Q
                     plot_two_distributions(
-                        Q_hat, Q_sample, dbg_path=f"dbg/ot_flow_fwd_epoch_{epoch}.png"
+                        Q_hat, Q_sample, dbg_path=f"dbg/ot_flow_fwd_epoch_{Tot}{1}_{epoch}.png"
                     )
 
                 # fit classifier 1 on new OT model
@@ -207,6 +209,66 @@ def train_OT_Flow(
                     "iter_index": iter_index,
                     "loss": loss.item(),
                     "KL_loss": KL_loss.item(),
+                    "gamma_W2_loss": gamma * W2_loss.item(),
+                    "W2_loss": W2_loss.item(),
+                    "clf_losses": clf_loss.item(),
+                    "grad_norm": next(model.parameters()).grad.data.norm(2).item(),
+                }
+                global_step += 1
+                wandb.log(wandb_log)
+
+        if iter_index == 0:
+            start_time = time.time()
+            for clf_step in range(E_0):
+                # Tensor Dataset returns a tuple so we have to take in as (P_sample, )
+                # start_time2 = time.time()
+                for (P_sample,), (Q_sample,) in zip(P_data_loader, Q_data_loader):
+                    P_hat = model(Q_sample, t=0.0, reverse=True).detach()
+                    clf_loss: Tensor = update_classifier(classifier2, clf2_optim, P_hat, P_sample)
+                    wandb.log({"init_clf_step": clf_step, "init_clf_loss": clf_loss.item()})
+                # print(f"epoch took {time.time() - start_time2:.2f}s")
+            print(f"initialization of clf0 took {time.time() - start_time}s")
+
+        for epoch in range(E):
+            first_data = True
+
+            print(f"starting epoch {epoch}")
+            for (P_sample,), (Q_sample,) in zip(P_data_loader, Q_data_loader):
+                ot_optim.zero_grad()
+
+                P_hat = model(P_sample, t=0.0)
+                classifier2.eval()
+                KL_loss = -classifier2(P_hat).mean()
+                classifier2.train()
+                W2_loss = model.get_W2_loss(P_sample, reverse=True)
+                loss = KL_loss + gamma * W2_loss
+                loss.backward()
+                ot_optim.step()
+
+                if first_data and epoch % 5 == 0:
+                    first_data = False
+                    # lets plot P_hat and P
+                    plot_two_distributions(
+                        P_hat, P_sample, dbg_path=f"dbg/ot_flow_fwd_epoch_{Tot}{2}_{epoch}.png"
+                    )
+
+                # fit classifier 1 on new OT model
+                clf_loss = None
+                model.eval()
+                for _ in range(E_in):
+                    P_hat = model(Q_sample, reverse=True).detach()
+                    clf_loss = update_classifier(
+                        classifier2, clf2_optim, P_hat, P_sample
+                    )
+                model.train()
+
+                wandb_log = {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "iter_index": iter_index,
+                    "loss": loss.item(),
+                    "KL_loss": KL_loss.item(),
+                    "gamma_W2_loss": gamma * W2_loss.item(),
                     "W2_loss": W2_loss.item(),
                     "clf_losses": clf_loss.item(),
                     "grad_norm": next(model.parameters()).grad.data.norm(2).item(),
@@ -220,6 +282,7 @@ def train_OT_Flow(
 def main():
     with open("config_ot_gaussians.yaml") as f:
         args = yaml.safe_load(f)
+    print("args:", args)
     run = wandb.init(entity="eddys", project="flow_basics", config=args)
     torch.random.manual_seed(42)
 
@@ -240,27 +303,26 @@ def main():
         device=device,
         **data_args,
     )
-    plot_two_distributions(P_data, Q_data, show=True)
+    plot_two_distributions(P_data, Q_data, dbg_path="dbg/tmp_P_and_Q.png")
 
-    breakpoint()
-
-    save_path = "chkpt/ot_flow_jko1_2.pt"
+    save_path = f"chkpt/{args['save_path']}.pt"
     os.makedirs("dbg/", exist_ok=True)
+    os.makedirs("chkpt/", exist_ok=True)
     if not args["load_JKO"]:
-        jko1, jko2 = init_and_train_jkos(P_data, Q_data, device=device, args=args)
+        jko1, jko2 = init_and_train_jkos(P_data, Q_data, device=device, args=args, ot_save_path=save_path)
     else:
         save_obj = torch.load(save_path, weights_only=False)
         jko1 = save_obj["jko1"]
         jko2 = save_obj["jko2"]
 
     otflow = OTFlow(jko1=jko1, jko2=jko2)
-    # visualize_otflow(otflow, P_data, Q_data)
     lr, clf_lr, gamma = map(
         float, itemgetter("lr", "clf_lr", "gamma")(args["ot_train"])
     )
     batch_size, Tot, E, E_0, E_in = map(
         int, itemgetter("batch_size", "Tot", "E", "E_0", "E_in")(args["ot_train"])
     )
+    visualize_otflow(otflow, P_data[:batch_size], Q_data[:batch_size], dbg_path="dbg/after_jko_warm_start.png")
 
     dim = args["jko"]["d"]
     clf1 = BasicClassifier(dim, device)

@@ -1,13 +1,10 @@
 import torch
-import torch.nn as nn
 from torch import Tensor
-from PIL import Image
 import numpy as np
 import yaml
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import os
-import torchdiffeq as tdeq
-import matplotlib.pyplot as plt
+from visualize_data import plot_2d_tensor
 import time
 from operator import itemgetter
 from data_gen import sample_points_from_image
@@ -98,12 +95,7 @@ def train_flow(
         }
         os.makedirs("chkpt", exist_ok=True)
         torch.save(sdict, f"chkpt/{save_path}_{block_idx}.pth")
-        plt.scatter(
-            prev_points[:, 0].cpu().detach().numpy(),
-            prev_points[:, 1].cpu().detach().numpy(),
-        )
-        plt.savefig(f"assets/block_{block_idx}.png")
-        plt.close()
+        plot_2d_tensor(prev_points, f"dbg/block_{block_idx}.png")
 
 
 def reparameterize_trajectory(
