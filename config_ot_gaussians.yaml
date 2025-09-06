@@ -7,7 +7,7 @@ jko:
   num_blocks: 8
 jko_train:
   num_points: 10000
-  epochs_per_block: 20
+  epochs_per_block: 2
   batch_size: 2048
   clip_grad: True
   lr: 0.01
@@ -18,13 +18,13 @@ ot_train:
   clf_lr: 1e-3
   Tot: 2
   E: 50
-  E_0: 300
+  E_0: 150
   E_in: 4
   gamma: 0.5
 N: 8192
 M: 8192
-save_path: moons_to_checkerboard_20
-load_JKO: False
+save_path: moons_to_checkerboard_2
+load_JKO: True
 data:
   P_distribution: moons
   Q_distribution: image
