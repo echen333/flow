@@ -171,11 +171,34 @@ class OTFlow(nn.Module):
             blocks = reversed(list(blocks))
         return blocks
 
-    def forward(self, x, t=0.0, reverse=False):
+    def forward(
+        self, x, t=0.0, reverse=False, all_block_outputs=False, full_traj=False
+    ):
+        """OTFlow model forward propagation
+
+        Args:
+            x (Tensor): Data
+            t (float, optional): time value. Defaults to 0.0.
+            reverse (bool, optional): Whether to go in reverse order. Defaults to False.
+            all_block_outputs (bool, optional): Whether to return output of all blocks. Defaults to False.
+            full_traj (bool, optional): Whether to return full trajectory per block. Defaults to False.
+
+        Returns:
+            Tensor: output
+        """
         blocks = self.get_blocks(reverse)
+        all_blocks_ret = [x]
         for idx, block in enumerate(blocks):
             is_reverse = idx >= len(self.jko1)
-            x, _, _ = block(x, reverse=is_reverse)
+            x, _, _ = block(x, reverse=is_reverse, full_traj=full_traj)
+            if all_block_outputs:
+                all_blocks_ret.append(x)
+
+        if all_block_outputs:
+            return torch.tensor(
+                torch.stack(all_blocks_ret)
+            )  # of size (len(blocks) + 1, D)
+
         return x
 
     def get_W2_loss(self, points: Tensor, reverse=False):

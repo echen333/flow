@@ -4,6 +4,8 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from models import OTFlow, ODEFuncBlock
 from typing import Optional
 from torch import Tensor
+import torch.nn as nn
+import seaborn as sns
 
 
 def plot_two_distributions(Q_hat, Q_data, dbg_path: Optional[str] = None, show=False):
@@ -95,3 +97,30 @@ def visualize_otflow_trajectory(flow: OTFlow, P_data, dbg_path: str, reverse=Fal
     writer = PillowWriter(fps=fps)
     anim.save(dbg_path, writer=writer)
     plt.close(fig)
+
+
+def visualize_DRE(classifier: nn.Module):
+    # same as gen data from image bounds
+    x = torch.linspace(-4, 4, 100)
+    y = torch.linspace(-4, 4, 100)
+    x, y = torch.meshgrid([x, y])
+
+    xx = torch.flatten(x)
+    yy = torch.flatten(y)
+    all_points = torch.stack([xx, yy], dim=1)
+
+    ret = classifier(all_points)
+    ret = ret.squeeze().detach().cpu().numpy()
+    ret = ret.reshape(-1, 100)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+
+    # sns.heatmap(ret, cmap="coolwarm")
+    mesh = ax.pcolormesh(x, y, ret, shading="auto", cmap="coolwarm")
+    ax.set_title("log (p/q)")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    cbar = plt.colorbar(mesh, ax=ax)
+    cbar.set_label("Value")
+    plt.savefig("assets/DRE_estimate.png")
+    plt.show()
