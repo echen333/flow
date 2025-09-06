@@ -316,12 +316,13 @@ def main():
         device=device,
         **data_args,
     )
-    plot_two_distributions(P_data, Q_data, dbg_path="dbg/tmp_P_and_Q.png")
 
-    # Initialize (and warm-start) our two JKO models. 
     save_path = f"chkpt/{args['save_path']}.pt"
     os.makedirs("dbg/", exist_ok=True)
     os.makedirs("chkpt/", exist_ok=True)
+    plot_two_distributions(P_data, Q_data, dbg_path="dbg/tmp_P_and_Q.png")
+
+    # Initialize (and warm-start) our two JKO models. 
     if not args["load_JKO"] or not os.path.exists(save_path):
         jko1, jko2 = init_and_train_jkos(P_data, Q_data, device=device, args=args, ot_save_path=save_path)
     else:

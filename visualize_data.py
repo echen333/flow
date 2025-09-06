@@ -1,6 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
-from models import OTFlow
+from matplotlib.animation import FuncAnimation, PillowWriter
+from models import OTFlow, ODEFuncBlock
 from typing import Optional
 from torch import Tensor
 
@@ -34,9 +35,54 @@ def plot_2d_tensor(data: Tensor, dbg_path: Optional[str]=None, show=False):
     plt.close()
 
 def visualize_otflow(flow: OTFlow, P_data, Q_data, dbg_path: Optional[str]=None, show=False):
+    """Plots both Q_data and Q_hat = flow(P_data)"""
     blocks = flow.get_blocks()
     prev_P = P_data
     for index, block in enumerate(blocks):
         is_reverse = index >= len(flow.jko1)
         prev_P, _, _ = block(prev_P, reverse=is_reverse)
         plot_two_distributions(prev_P, Q_data, dbg_path=dbg_path, show=show)
+
+def visualize_otflow_trajectory(flow: OTFlow, P_data, dbg_path: str):
+    """Generate gif of trajectory using flow model from initial P_data. Saves gif to dbg_path."""
+    if P_data.shape[-1] != 2:
+        raise NotImplementedError
+
+    frames = []
+    blocks: list[ODEFuncBlock] = flow.get_blocks()
+    prev_P = P_data
+    for index, block in enumerate(blocks):
+        is_reverse = (index >= len(flow.jko1))
+        xT, _, _ = block(prev_P, reverse=is_reverse, full_traj=True)
+        prev_P = xT[-1]
+        
+        xs = xT[:, :, :] # have to make a copy i think, shape (T,B, 2)
+        for t in range(xs.shape[0]):
+            frames.append(xs[t].detach().cpu().numpy())
+    
+    for end_frames in range(10):
+        frames.append(frames[-1])
+    print("len frames", len(frames))
+
+    fig, ax = plt.subplots(figsize=(5,5))
+    x0 = frames[0]
+    s, fps = 8, 25
+    scat = ax.scatter(x0[0], x0[1], s=s, alpha=0.9)
+
+    ax.set_xlim(-5, 5)
+    ax.set_ylim(-5,5)
+    ax.set_title("Particle flow")
+
+    def init():
+        scat.set_offsets(frames[0])
+        return (scat, )
+
+    def update(i):
+        scat.set_offsets(frames[i])
+        return (scat, )
+
+    anim = FuncAnimation(fig, update, init_func=init, frames=len(frames), interval=1000/fps, blit=True)
+    writer = PillowWriter(fps=fps)
+    anim.save(dbg_path, writer=writer)
+    plt.close(fig)
+

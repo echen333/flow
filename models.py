@@ -84,7 +84,7 @@ class ODEFuncBlock(nn.Module):
         djac_dt = torch.zeros_like(logdet)
         return (vfield, dlogdet_dt, djac_dt)
 
-    def forward(self, x0, t=0.0, reverse=False):
+    def forward(self, x0, t=0.0, reverse=False, full_traj=False):
         t_start, t_end = float(t), float(t) + float(self.h_k)
         t_grid = torch.linspace(
             t_start, t_end, self.h_steps + 1, dtype=x0.dtype, device=self.device
@@ -100,6 +100,8 @@ class ODEFuncBlock(nn.Module):
             self._rhs, (x0, logdet0, jac0), t_grid, method=self.ode_solver
         )
 
+        if full_traj:
+            return xT, logdetT, jacT
         return xT[-1], logdetT[-1], jacT[-1]
 
 

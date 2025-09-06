@@ -3,6 +3,7 @@ from torch import Tensor
 from sklearn.datasets import make_moons
 import numpy as np
 from PIL import Image
+from typing import Optional
 
 
 def get_gaussian(mu: Tensor, sigma: float, num_samples: int, device="cpu"):
@@ -47,7 +48,7 @@ def sample_points_from_image(image_path: str, num_points=10000):
 
 
 def get_samples(
-    distribution: str, num_samples: int, device: str, prefix: str, **kwargs
+    distribution: str, num_samples: int, device: str, prefix: Optional[str], **kwargs
 ):
     if distribution == "moons":
         return gen_moons(
