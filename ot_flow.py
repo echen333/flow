@@ -81,7 +81,7 @@ def init_and_train_jkos(
 def update_classifier(
     classifier: nn.Module, clf_optim, D_hat: Tensor, D_sample: Tensor
 ) -> Tensor:
-    N, M = D_sample.shape[0], D_sample.shape[0]
+    N, M = D_hat.shape[0], D_sample.shape[0]
     device = classifier.device
     X = torch.concat([D_hat, D_sample])
     y = torch.concat([torch.zeros(N, device=device), torch.ones(M, device=device)])
@@ -237,7 +237,7 @@ def train_OT_Flow(
             for (P_sample,), (Q_sample,) in zip(P_data_loader, Q_data_loader):
                 ot_optim.zero_grad()
 
-                P_hat = model(P_sample, t=0.0, reverse=True)
+                P_hat = model(Q_sample, t=0.0, reverse=True)
                 classifier2.eval()
                 KL_loss = -classifier2(P_hat).mean()
                 classifier2.train()
@@ -287,7 +287,8 @@ def train_OT_Flow(
             "clf2_optim": clf2_optim.state_dict(),
         }
         if save_path is not None:
-            torch.save(save_object, f"chkpt/{save_path}_{iter_index}.pt")
+            print(f"saving object to {save_path}_{iter_index}.pt")
+            torch.save(save_object, f"{save_path}_{iter_index}.pt")
 
 
 def main():
@@ -357,6 +358,7 @@ def main():
         E_in=E_in,
         gamma=gamma,
         args=args,
+        save_path=f"{save_path}_ot"
     )
 
 
