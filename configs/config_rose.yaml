@@ -1,4 +1,4 @@
-image_path: img_rose.png
+image_path: assets/img_rose.png
 train:
   num_points: 10000
   epochs_per_block: 100

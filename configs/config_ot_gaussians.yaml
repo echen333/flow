@@ -28,4 +28,4 @@ load_JKO: False
 data:
   P_distribution: moons
   Q_distribution: image
-  Q_image_path: img_checkerboard.png
+  Q_image_path: assets/img_checkerboard.png

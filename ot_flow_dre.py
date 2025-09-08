@@ -87,7 +87,11 @@ def main():
 
     P_data = get_samples("moons", 2048, device=device, prefix=None)
     Q_data = get_samples(
-        "image", 2048, device=device, prefix="Q", Q_image_path="img_checkerboard.png"
+        "image",
+        2048,
+        device=device,
+        prefix="Q",
+        Q_image_path="assets/img_checkerboard.png",
     )
 
     train_DRE_classifier(classifier, model, 0.001, P_data, Q_data)

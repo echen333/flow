@@ -13,7 +13,11 @@ def main():
     P_data = get_samples("moons", 2048, device=device, prefix=None)
     visualize_otflow_trajectory(flow_model, P_data, "assets/moons_traj.gif")
     Q_data = get_samples(
-        "image", 2048, device=device, prefix="Q", Q_image_path="img_checkerboard.png"
+        "image",
+        2048,
+        device=device,
+        prefix="Q",
+        Q_image_path="assets/img_checkerboard.png",
     )
     visualize_otflow_trajectory(
         flow_model, Q_data, "assets/moons_traj2.gif", reverse=True

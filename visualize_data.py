@@ -79,8 +79,8 @@ def visualize_otflow_trajectory(flow: OTFlow, P_data, dbg_path: str, reverse=Fal
     s, fps = 8, 12
     scat = ax.scatter(x0[0], x0[1], s=s, alpha=0.9)
 
-    ax.set_xlim(-5, 5)
-    ax.set_ylim(-5, 5)
+    ax.set_xlim(-4, 4)
+    ax.set_ylim(-4, 4)
     ax.set_title("Particle flow")
 
     def init():
