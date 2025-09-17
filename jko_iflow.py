@@ -9,6 +9,7 @@ import time
 from operator import itemgetter
 from data_gen import sample_points_from_image
 from models import JKO, ODEFuncBlock, NN
+from data_gen import get_samples
 
 
 def get_JKO(h_0, h_max, rho, num_blocks, sigma_0, d, device="cpu"):
@@ -94,6 +95,7 @@ def train_flow(
             "args": args,
         }
         os.makedirs("chkpt", exist_ok=True)
+        os.makedirs("dbg/", exist_ok=True)
         torch.save(sdict, f"chkpt/{save_path}_{block_idx}.pth")
         plot_2d_tensor(prev_points, f"dbg/block_{block_idx}.png")
 
@@ -128,24 +130,8 @@ def reparameterize_trajectory(
     # TODO: do we need to train a free block at end?
 
 
-# TODO: Remove
-class ResamplingDataset(IterableDataset):
-    def __init__(self, sampling_fn, num_epochs, device="cpu"):
-        super().__init__()
-        self.sampling_fn = sampling_fn
-        self.num_epochs = num_epochs
-        self.device = device
-
-    def __len__(self):
-        return self.num_epochs
-
-    def __iter__(self):
-        for _ in range(self.num_epochs):
-            yield self.sampling_fn().to(self.device)
-
-
 def main():
-    path = "config_rose.yaml"
+    path = "configs/config_rose.yaml"
     with open(path, "r") as f:
         args = yaml.safe_load(f)
     print(args)
@@ -154,33 +140,29 @@ def main():
     points = sample_points_from_image(args["image_path"], args["train"]["num_points"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    h_ks = [
-        min(args["h_max"], args["h_0"] * (args["rho"] ** idx))
-        for idx in range(args["num_blocks"])
-    ]
-    method = "rk4"
-    flow = JKO(
-        [
-            ODEFuncBlock(
-                h_ks[idx],
-                NN(device),
-                args["sigma_0"] / np.sqrt(args["d"]),
-                device=device,
-                ode_solver=method,
-            )
-            for idx in range(args["num_blocks"])
-        ]
+    h_0, h_max, rho, num_blocks, sigma_0, d = itemgetter(
+        "h_0", "h_max", "rho", "num_blocks", "sigma_0", "d"
+    )(args)
+    flow = get_JKO(
+        h_0=h_0,
+        h_max=h_max,
+        rho=rho,
+        num_blocks=num_blocks,
+        sigma_0=sigma_0,
+        d=d,
+        device=device,
     )
 
     points = points.to(device=device)
     train_args = args["train"]
-    train_dataset = ResamplingDataset(
-        lambda: sample_points_from_image(
-            args["image_path"], args["train"]["num_points"]
-        ),
-        train_args["epochs_per_block"],
-        "cpu",
+    train_dataset = get_samples(
+        "image",
+        args["train"]["num_points"],
+        device,
+        prefix="P",
+        P_image_path=args["image_path"],
     )
+
     lr, batch_size, clip_grad, save_path = itemgetter(
         "lr", "batch_size", "clip_grad", "save_path"
     )(args["train"])
@@ -194,10 +176,11 @@ def main():
         clip_grad=clip_grad,
         save_path=save_path,
     )
-    print(f"h_k before {[block.h_k for block in flow.blocks]}")
+
+    print(f"h_k before reparameterize: {[block.h_k for block in flow.blocks]}")
     reparameterize_trajectory(flow, points, 10, args["ema_parameter"], args["h_max"])
     h_ks = [block.h_k for block in flow.blocks]
-    print(f"h_k after {h_ks}")
+    print(f"h_k after reparameterize: {h_ks}")
     train_flow(
         flow,
         train_dataset,
