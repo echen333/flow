@@ -5,12 +5,10 @@ from jko_iflow import (
     NN,
 )
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 
 
-def test_forward():
-    pass
+"""Random testing python file that loades in model from save_path."""
 
 
 def main():

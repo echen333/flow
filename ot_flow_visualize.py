@@ -3,6 +3,9 @@ from visualize_data import visualize_otflow_trajectory
 from data_gen import get_samples
 
 
+"""Generate the gif of moons < --- > checkerboard using model from save_path."""
+
+
 def main():
     save_path = "chkpt/moons_to_checkerboard_ot_1.pt"
     device = "cuda" if torch.cuda.is_available() else "cpu"
